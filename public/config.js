@@ -77,7 +77,7 @@ window.BLOG_CONFIG = {
       // 外部链接会自动新窗口打开（无需改代码，改此数组即可）。
     ],
     links: [
-     { text: '语幕', url: 'https://www.yumus.cn' }
+     { text: '叶落', url: 'https://www.yeluo.net' }
     ],
     decl: '本站部分内容转载自网络，作品版权归原作者及来源网站所有，任何内容转载、商业用途等均须联系原作者并注明来源。',
     email: 'admin@cloumail.com',
