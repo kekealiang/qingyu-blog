@@ -78,6 +78,8 @@ window.BLOG_CONFIG = {
     ],
     links: [
      { text: '叶落', url: 'https://www.yeluo.net' }
+     { text: '80后', url: 'https://80h.fun' }
+      { text: '就要乐享', url: 'https://91lx.net' }
     ],
     decl: '本站部分内容转载自网络，作品版权归原作者及来源网站所有，任何内容转载、商业用途等均须联系原作者并注明来源。',
     email: 'admin@cloumail.com',
