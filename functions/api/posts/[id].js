@@ -1,6 +1,6 @@
 /* Cloudflare Pages Functions · /api/posts/:id
  * GET  → 单篇    PUT → 更新    DELETE → 删除
- * 数据存储于 KV 命名空间 BLOG（见 wrangler.toml）
+ * 数据存储于 D1 数据库（绑定名 DB，见 wrangler.toml）
  */
 import { handlePostId } from '../../_lib/api-core.js';
 

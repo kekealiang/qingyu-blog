@@ -1,18 +1,21 @@
 # ============================================================
 # 轻语博客 · GitHub Actions 自动部署到 Cloudflare Workers
 # ------------------------------------------------------------
-# 部署目标：Cloudflare Workers（域名 kejiland.azhz.workers.dev
+# 部署目标：Cloudflare Workers（域名 www.2024921.xyz
 #   → 默认 worker 名 kejiland；Secrets 设置 PAGES_PROJECT_NAME 可覆盖）
 # 敏感数据全部存放在 GitHub Secrets，部署时注入：
 #   · PAGES_PROJECT_NAME  （可选）自定义 worker 名；不设置 = 用 wrangler.workers.toml 的 name
 #   · BLOG_KV_ID          → 部署前替换进 wrangler.workers.toml 的 [[kv_namespaces]] id
 #                          （wrangler 对 kv id 不支持 {env.} 内插，用 python3 显式替换）
-#   · BLOG_ADMIN_SETUP_KEY→ 首次设置管理员密码的一次性密钥（部署后写入 secret）
+#   · BLOG_ADMIN_SETUP_KEY→（可选）管理员初始化安装密钥。配置后 /api/admin/setup 首次
+#                          初始化与重置均需 X-Setup-Key（杜绝抢注，推荐）；未配置时
+#                          回退旧行为：首次部署登录接口自动生成随机默认密码（存在先到
+#                          先得竞态，全新部署建议配置）。已初始化实例登录不受影响
 #   · BLOG_WRITE_TOKEN    →（可选）旧式写入令牌
 #   · CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID → wrangler 部署凭证
 #   · SITE_URL  （可选，强烈建议）站点对外域名 https://你的域名，用于收紧 CORS 为仅允许本站
 #   · CF_ZONE_ID（可选）自定义域名的 Zone ID，配合 CF_API_TOKEN 实现「发布即清边缘缓存」
-#       （两者均缺失时自动降级为空，不影响部署；SITE_URL 缺失时 CORS 回退为回显来源）
+#       （两者均缺失时自动降级为空，不影响部署；SITE_URL 缺失时 CORS 为 fail-closed——不返回 ACAO）
 # 触发：push 到 main / 手动运行。
 # ============================================================
 name: Deploy to Cloudflare Workers
@@ -37,32 +40,59 @@ jobs:
         with:
           node-version: 24
 
+      # 一次性全局安装 wrangler（CI 镜像层缓存 → 首次快，之后直接用 wrangler 命令）
+      # 避免下方 migrations 循环与 secret 写入里每次 npx --yes 重复解析/网络检查
+      # 若启用了边缘限流绑定（BLOG_RATE_LIMIT_BINDING），则需要 wrangler >= 4.36
+      - name: Setup wrangler CLI
+        env:
+          RL_BINDING: ${{ secrets.BLOG_RATE_LIMIT_BINDING }}
+        run: |
+          if [ -n "$RL_BINDING" ]; then
+            npm install -g 'wrangler@^4.36.0'
+            echo "✅ 已启用边缘限流绑定 → 使用 wrangler 4.x（该绑定要求 4.36.0+）"
+          else
+            npm install -g wrangler@3.90.0
+            echo "✅ 使用 wrangler 3.90.0（未启用边缘限流绑定）"
+          fi
+
+      # 部署前跑本地测试（纯 Node 模拟环境，无网络/无凭据依赖；失败即中止，不部署）
+      - name: Run tests (smoke + verify)
+        run: |
+          node smoke-test.js
+          node gb-verify.js
+          node search-verify.js
+
       - name: Check required secrets
         env:
           BLOG_KV_ID: ${{ secrets.BLOG_KV_ID }}
           BLOG_D1_ID: ${{ secrets.BLOG_D1_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BLOG_ADMIN_SETUP_KEY: ${{ secrets.BLOG_ADMIN_SETUP_KEY }}
         run: |
           MISSING=""
+          # BLOG_ADMIN_SETUP_KEY 为可选（见文件头注释：配置后 setup 需 X-Setup-Key；
+          # 未配置回退旧随机密码流程），不做必填校验
           for v in BLOG_KV_ID BLOG_D1_ID CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
             if [ -z "${!v}" ]; then MISSING="$MISSING $v"; fi
           done
           if [ -n "$MISSING" ]; then
             echo "::error::缺少必要的 GitHub Secrets:$MISSING"
             echo "请到 仓库 Settings → Secrets and variables → Actions 添加后重试。"
+            echo "（BLOG_ADMIN_SETUP_KEY 可选：配置后 /api/admin/setup 需安装密钥；未配置时首次部署自动生成随机默认密码）"
             exit 1
           fi
-          echo "✅ 必要 Secrets 齐全（值不会打印）"
+          echo "✅ 必要 Secrets 齐全（值不会打印；BLOG_ADMIN_SETUP_KEY 可选）"
 
-      # 诊断：验证凭证账户，便于定位 8000007 类错误
+      # 诊断：验证凭证账户，便于定位 8000007 类错误（仅手动触发时运行，日常 push 跳过节省时间）
       - name: Diagnose account & worker
+        if: github.event_name == 'workflow_dispatch'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           echo "=== 账户 $CLOUDFLARE_ACCOUNT_ID ==="
-          npx --yes wrangler@3.90.0 whoami 2>&1 | head -20 || true
+          wrangler whoami 2>&1 | head -20 || true
 
       # 生成带真实 KV id 的部署配置（wrangler 对 kv 的 id 不支持 {env.} 内插，
       # 必须显式替换占位符；文件放在仓库根目录，保证 worker.js/public 的相对路径正确）
@@ -72,6 +102,7 @@ jobs:
           BLOG_D1_ID: ${{ secrets.BLOG_D1_ID }}
           SITE_URL: ${{ secrets.SITE_URL }}
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          BLOG_RATE_LIMIT_BINDING: ${{ secrets.BLOG_RATE_LIMIT_BINDING }}
         run: |
           python3 - <<'PY'
           import os
@@ -91,55 +122,97 @@ jobs:
           # 非敏感变量：缺失则替换为空字符串（安全降级，不会留下字面量占位符）
           dst = dst.replace('{env.SITE_URL}', os.environ.get('SITE_URL', '').strip())
           dst = dst.replace('{env.CF_ZONE_ID}', os.environ.get('CF_ZONE_ID', '').strip())
+          # 边缘限流绑定（可选）：配置了 BLOG_RATE_LIMIT_BINDING 才注入。
+          # 该绑定需要 wrangler >= 4.36，且并非所有账户都支持，因此默认不写入——
+          # 未配置时行为与旧版完全一致（代码会回退到 D1 计数）。
+          rl = os.environ.get('BLOG_RATE_LIMIT_BINDING', '').strip()
+          if rl and not rl.isdigit():
+              print('::error::BLOG_RATE_LIMIT_BINDING 必须是正整数（Workers 限流绑定的 namespace_id，如 1001）')
+              raise SystemExit(1)
+          if rl:
+              dst += (
+                  '\n# 由 BLOG_RATE_LIMIT_BINDING 注入的边缘限流绑定（env.LOGIN_LIMITER）\n'
+                  '[[ratelimits]]\n'
+                  'name = "LOGIN_LIMITER"\n'
+                  'namespace_id = "' + rl + '"\n'
+                  '  [ratelimits.simple]\n'
+                  '  limit = 10\n'
+                  '  period = 60\n'
+              )
+          # 先落盘再打印：避免控制台编码异常（如局部 GBK）导致配置没写出来
           open('wrangler.workers.ci.toml', 'w', encoding='utf-8').write(dst)
+          if rl:
+              print('✅ 已注入边缘限流绑定 namespace_id=' + rl + '（登录限流 10 次/分钟/位置）')
           print('✅ 部署配置已生成（含真实 KV id 与 D1 id，不会打印）')
           PY
 
-      # 部署前应用 D1 表结构（幂等：CREATE TABLE IF NOT EXISTS，按序执行 migrations/*.sql）。
-      # 需先在 Cloudflare 创建名为 blog 的 D1 数据库，并把其 database_id 填入 Secret BLOG_D1_ID。
-      - name: Apply D1 schema (migrations/*.sql)
+      # 部署前应用 D1 表结构（migrations/*.sql，按文件名升序执行）。
+      # 幂等策略（三层）：
+      #   1) schema_migrations 记账表：已成功执行的迁移直接跳过（覆盖 0012 删数据等非重跑安全文件）；
+      #   2) 已知 ALTER 加列类迁移（0003/0004/0005/0010/0011）：执行前先查列是否已存在，
+      #      存在则记账跳过——注意 0001 新库已含这些列，老库也已加过，
+      #      直接执行必然 duplicate column（SQLite 无 ADD COLUMN IF NOT EXISTS）；
+      #   3) 兜底：偶发执行失败时，若报错含 duplicate column / already exists 之类字样，
+      #      按「已应用」记账跳过；其余错误完整打印输出并中断，避免半套 schema 上线。
+      - name: Apply D1 schema (migrations/*.sql with schema_migrations ledger)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           BLOG_D1_ID: ${{ secrets.BLOG_D1_ID }}
         run: |
-          # 查询某表是否存在指定列（用于 ALTER 类迁移的幂等跳过）
+          # 建记账表（幂等；不静默，失败可见便于诊断）
+          wrangler d1 execute blog --remote --config wrangler.workers.ci.toml \
+            --command "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))"
+          # 已应用的迁移名清单（读失败按空处理，下轮重试）
+          applied=$(wrangler d1 execute blog --remote --config wrangler.workers.ci.toml \
+            --command "SELECT name FROM schema_migrations" --json 2>/dev/null \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(r['name'] for r in (d[0]['results'] if d and d[0].get('results') else [])))" 2>/dev/null || true)
+          # 查询某表是否已有指定列（pragma_table_info，与旧机制一致，避免依赖报错文本）
           check_col() {
             local tbl="$1" col="$2"
-            npx --yes wrangler@3.90.0 d1 execute blog --remote --config wrangler.workers.ci.toml \
+            wrangler d1 execute blog --remote --config wrangler.workers.ci.toml \
               --command "SELECT COUNT(*) AS n FROM pragma_table_info('$tbl') WHERE name='$col'" --json 2>/dev/null \
               | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['results'][0]['n'] if d and d[0].get('results') else 0)" 2>/dev/null || echo 0
           }
           for f in migrations/*.sql; do
-            echo "Applying $f"
             base=$(basename "$f")
-            skip=0
-            # ALTER 加列类迁移幂等：先查列是否存在，存在则跳过，
-            # 避免重复执行 ALTER TABLE ADD COLUMN 报 duplicate column（SQLite 无 IF NOT EXISTS）
-            case "$base" in
-              0003_cover_column.sql)    [ "$(check_col posts cover)" -gt 0 ] 2>/dev/null && skip=1 ;;
-              0004_post_meta.sql)       [ "$(check_col posts category)" -gt 0 ] 2>/dev/null && skip=1 ;;
-              0005_comment_status.sql)  [ "$(check_col comments status)" -gt 0 ] 2>/dev/null && skip=1 ;;
-              0010_admin_must_change.sql) [ "$(check_col admin_auth must_change)" -gt 0 ] 2>/dev/null && skip=1 ;;
-              0011_comment_reply.sql)    [ "$(check_col comments parent_id)" -gt 0 ] 2>/dev/null && skip=1 ;;
-              # 0009 使用 CREATE INDEX IF NOT EXISTS，天然幂等，不跳过
-            esac
-            if [ "$skip" -eq 1 ]; then
-              echo "→ 列已存在，跳过（幂等）"
+            echo "Applying $f"
+            # 已在记账表 → 跳过
+            if printf '%s\n' "$applied" | grep -qx "$base"; then
+              echo "→ 已在 schema_migrations，跳过"
               continue
             fi
-            out=$(npx --yes wrangler@3.90.0 d1 execute blog --remote --config wrangler.workers.ci.toml --file="$f" 2>&1)
+            # ALTER 加列类迁移：列已存在则记账跳过（不执行）
+            tbl=""; col=""
+            case "$base" in
+              0003_cover_column.sql)      tbl=posts;      col=cover ;;
+              0004_post_meta.sql)         tbl=posts;      col=category ;;
+              0005_comment_status.sql)    tbl=comments;   col=status ;;
+              0010_admin_must_change.sql) tbl=admin_auth; col=must_change ;;
+              0011_comment_reply.sql)     tbl=comments;   col=parent_id ;;
+            esac
+            if [ -n "$col" ] && [ "$(check_col "$tbl" "$col")" -gt 0 ] 2>/dev/null; then
+              echo "→ 列 $tbl.$col 已存在（老库已应用），按已应用记账并跳过"
+              wrangler d1 execute blog --remote --config wrangler.workers.ci.toml \
+                --command "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('$base')" >/dev/null 2>&1
+              continue
+            fi
+            out=$(wrangler d1 execute blog --remote --config wrangler.workers.ci.toml --file="$f" 2>&1)
             code=$?
             if [ $code -ne 0 ]; then
-              # 兜底：万一上面的列查询不可用（如 D1 不支持 pragma_table_info），
-              # 仍按错误文本识别 duplicate column 并跳过
-              if echo "$out" | grep -qi "duplicate column"; then
-                echo "→ 列已存在，跳过（幂等）"
+              # 兜底：预检查遗漏的 duplicate column 类报错按「已应用」记账；其余完整打印并中断
+              if echo "$out" | grep -qiE "duplicate column|already has a column|already exists"; then
+                echo "→ 列已存在（duplicate column），按已应用记账并跳过"
               else
-                echo "$out"; exit 1
+                echo "$out"
+                exit 1
               fi
             fi
+            # 记账：成功或兜底命中都写入 schema_migrations
+            wrangler d1 execute blog --remote --config wrangler.workers.ci.toml \
+              --command "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('$base')" >/dev/null 2>&1
           done
+          echo "✅ D1 schema 应用完成"
 
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v3
@@ -159,16 +232,42 @@ jobs:
           BLOG_WRITE_TOKEN: ${{ secrets.BLOG_WRITE_TOKEN }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+          R2_MEDIA_BUCKET: ${{ secrets.R2_MEDIA_BUCKET }}
+          R2_MEDIA_PUBLIC_BASE: ${{ secrets.R2_MEDIA_PUBLIC_BASE }}
           NAME_ARG: ${{ secrets.PAGES_PROJECT_NAME != '' && format('--name {0}', secrets.PAGES_PROJECT_NAME) || '' }}
         run: |
           if [ -n "$BLOG_ADMIN_SETUP_KEY" ]; then
-            echo "$BLOG_ADMIN_SETUP_KEY" | npx --yes wrangler@3.90.0 secret put BLOG_ADMIN_SETUP_KEY --config wrangler.workers.ci.toml $NAME_ARG
+            echo "$BLOG_ADMIN_SETUP_KEY" | wrangler secret put BLOG_ADMIN_SETUP_KEY --config wrangler.workers.ci.toml $NAME_ARG
           fi
           if [ -n "$BLOG_WRITE_TOKEN" ]; then
-            echo "$BLOG_WRITE_TOKEN" | npx --yes wrangler@3.90.0 secret put BLOG_WRITE_TOKEN --config wrangler.workers.ci.toml $NAME_ARG
+            echo "$BLOG_WRITE_TOKEN" | wrangler secret put BLOG_WRITE_TOKEN --config wrangler.workers.ci.toml $NAME_ARG
           fi
           # CF_API_TOKEN 同时作为「发布即清缓存」的运行时凭证（purgeTags 需要 Zone·Cache Purge 权限）
           if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "$CLOUDFLARE_API_TOKEN" | npx --yes wrangler@3.90.0 secret put CF_API_TOKEN --config wrangler.workers.ci.toml $NAME_ARG
+            echo "$CLOUDFLARE_API_TOKEN" | wrangler secret put CF_API_TOKEN --config wrangler.workers.ci.toml $NAME_ARG
+          fi
+          # R2（音乐直传）：配置了才写入；R2 未配置时音乐上传接口自动降级为 503，不影响其余功能
+          if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_BUCKET" ]; then
+            echo "$R2_ACCESS_KEY_ID"     | wrangler secret put R2_ACCESS_KEY_ID     --config wrangler.workers.ci.toml $NAME_ARG
+            echo "$R2_SECRET_ACCESS_KEY" | wrangler secret put R2_SECRET_ACCESS_KEY --config wrangler.workers.ci.toml $NAME_ARG
+            echo "$R2_ENDPOINT"          | wrangler secret put R2_ENDPOINT          --config wrangler.workers.ci.toml $NAME_ARG
+            echo "$R2_BUCKET"            | wrangler secret put R2_BUCKET            --config wrangler.workers.ci.toml $NAME_ARG
+          fi
+          # R2 公开读取域名（音频播放地址基址）；有货才写
+          if [ -n "$R2_PUBLIC_BASE" ]; then
+            echo "$R2_PUBLIC_BASE" | wrangler secret put R2_PUBLIC_BASE --config wrangler.workers.ci.toml $NAME_ARG
+          fi
+          # R2 媒体桶（图片直传，独立于音乐桶）：凭据与音乐共用，桶名/公开域名独立；
+          # 未配置时媒体上传接口自动降级为 503，不影响其余功能
+          if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_MEDIA_BUCKET" ]; then
+            echo "$R2_MEDIA_BUCKET" | wrangler secret put R2_MEDIA_BUCKET --config wrangler.workers.ci.toml $NAME_ARG
+          fi
+          if [ -n "$R2_MEDIA_PUBLIC_BASE" ]; then
+            echo "$R2_MEDIA_PUBLIC_BASE" | wrangler secret put R2_MEDIA_PUBLIC_BASE --config wrangler.workers.ci.toml $NAME_ARG
           fi
           rm -f wrangler.workers.ci.toml

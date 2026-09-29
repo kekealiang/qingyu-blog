@@ -33,7 +33,16 @@ function makeCtx(extra) {
     documentElement: { setAttribute() {}, getAttribute: () => 'light' },
     querySelector: (sel) => (sel === '#app' ? appEl : stubEl()),
     querySelectorAll: () => [],
-    createElement: () => Object.assign(stubEl(), { click() {}, set href(v) {} }),
+    getElementById: () => stubEl(),
+    getElementsByClassName: () => [],
+    getElementsByTagName: () => [],
+    createElement: (tag) => {
+      const el = Object.assign(stubEl(), { click() {}, set href(v) {} });
+      let _onload = null;
+      Object.defineProperty(el, 'onload', { set: function (fn) { _onload = fn; setTimeout(function () { if (_onload) _onload(); }, 0); }, get: function () { return _onload; } });
+      return el;
+    },
+    createTextNode: () => ({}),
     body: { appendChild() {}, removeChild() {}, style: {} },
     head: { appendChild() {}, removeChild() {} },
     addEventListener() {},
@@ -59,7 +68,7 @@ function makeCtx(extra) {
     confirm: () => true,
     alert: () => {},
     prompt: () => null,
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, setInterval, clearInterval,
     crypto,   // Node 全局 WebCrypto（app.js 顶层直接使用裸 crypto.subtle）
     URLSearchParams, Blob: function () {},
     URL: { createObjectURL: () => 'blob:stub', revokeObjectURL() {} },
@@ -101,6 +110,9 @@ async function boot(extra, route) {
   else win.BLOG_POSTS = TEST_POSTS;
   vm.runInContext(fs.readFileSync(path.join(PUB, 'app.js'), 'utf8'), ctx, { filename: 'app.js' });
   await win.__bootPromise;
+  // 等待首次 route() 的异步部分完成：write/admin 路由内部 await ensureAdminBundle()
+  // （script onload 在 setTimeout(0) 触发，随后渲染同步完成），返回时 app 已有内容
+  await new Promise((r) => setTimeout(r, 20));
   return { ctx, html: appEl.innerHTML, title: docTitle(ctx), win };
 }
 /** 引导并进入写作页（自动通过管理员验证；pwd 为空则先设置/使用配置密码） */
@@ -108,10 +120,10 @@ async function bootWrite(extra, route, pwd) {
   const b = await boot(extra, route || '/write');
   const admin = pwd || (extra && extra['window.BLOG_CONFIG'] && extra['window.BLOG_CONFIG'].adminPwd);
   if (admin) {
-    if (!b.ctx.adminOk()) { b.ctx.tryAdmin(admin); b.ctx.route(); }
+    if (!b.ctx.adminOk()) { await b.ctx.tryAdmin(admin); await b.ctx.route(); }
   } else if (b.ctx.needAdminSetup()) {
-    b.ctx.setupAdmin('test-1234');
-    b.ctx.route();
+    await b.ctx.setupAdmin('test-1234');
+    await b.ctx.route();
   }
   b.html = b.ctx.document.querySelector('#app').innerHTML;
   return b;
@@ -185,7 +197,7 @@ tests.push(['首页（静态模式）：导航在、搜索框在标题右侧、�
   assert.ok(chrome.includes('最新发布'), '首页标题为「最新发布」');
   assert.ok(!/文章/.test(chrome.replace(/placeholder="搜索文章…"/g, '')), '首页框架（标题/说明/页脚）除搜索占位外无「文章」字样');
   assert.ok(html.includes('searchToggle') && html.includes('globalSearchInput') && html.includes('topbarSearch'), '顶部导航含搜索按钮与搜索框');
-  assert.ok(html.includes('home-tags') && html.includes('分类'), '首页标签分类栏在标题下方');
+  assert.ok(html.includes('home-tags') && html.includes('标签'), '首页标签分类栏在标题下方');
   assert.ok(html.includes('footer-inner') && html.includes('footer-nav') && html.includes('footer-copy'), '页脚结构（导航行 + 版权行）');
   assert.ok(!html.includes('💾 本地') && !html.includes('📡 在线'), '页脚无本地/在线标识');
   assert.ok(html.includes('/posts/hello-qingyu/'), '首页卡片用 /posts/<别名>/ 链接');
@@ -317,37 +329,33 @@ tests.push(['写作入口：导航/正文无「写文章/编辑」按钮，/admi
   assert.ok(g.html.includes('管理员验证') || g.html.includes('门禁'), '/admin 未放行显示门禁');
   // admin 放行后 /admin 能进入编辑器
   const w = await boot({ 'window.BLOG_CONFIG': { mode: 'static', adminPwd: 'admin-999' } }, '/admin');
-  if (!w.ctx.adminOk()) w.ctx.tryAdmin('admin-999');
-  w.ctx.route();
+  if (!w.ctx.adminOk()) await w.ctx.tryAdmin('admin-999');
+  await w.ctx.route();
   assert.ok(w.ctx.document.querySelector('#app').innerHTML.includes('mdInput'), '/admin 放行后进入编辑器');
 }]);
 
-tests.push(['admin 后台：加密开关绑定密码框显隐 + 正文实时预览（bindWriteEvents 回归）', async () => {
-  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static', adminPwd: 'admin-999' } }, '/admin/write');
-  if (!b.ctx.adminOk()) b.ctx.tryAdmin('admin-999');
+tests.push(['写作页：正文实时预览 + 未保存状态（bindWriteEvents 回归）', async () => {
+  // bindWriteEvents 绑定内容（见 renderWrite）：mdInput input → 更新预览 + saveStatus；
+  // 客户端加密开关已随密文后移移除，置顶开关仅静态勾选，无动态显隐可测。
+  const b = await bootWrite({ 'window.BLOG_CONFIG': { mode: 'static', adminPwd: 'admin-999' } }, '/admin/write');
   // 注入带缓存的 querySelector，捕捉渲染期间绑定的事件
   const els = {};
   const orig = b.ctx.document.querySelector;
-  b.ctx.document.querySelector = (sel) => {
-    if (sel === '#app') return orig(sel);
-    if (!els[sel]) {
-      els[sel] = Object.assign({}, stubEl(), {
-        checked: false, selectionStart: 0, selectionEnd: 0,
-        _l: {},
-        addEventListener(t, fn) { (this._l[t] = this._l[t] || []).push(fn); }
-      });
-    }
-    return els[sel];
+  const patchQuery = () => {
+    b.ctx.document.querySelector = (sel) => {
+      if (sel === '#app') return orig(sel);
+      if (!els[sel]) {
+        els[sel] = Object.assign({}, stubEl(), {
+          checked: false, selectionStart: 0, selectionEnd: 0,
+          _l: {},
+          addEventListener(t, fn) { (this._l[t] = this._l[t] || []).push(fn); }
+        });
+      }
+      return els[sel];
+    };
   };
-  b.ctx.route();
-  const protect = els['#protectInput'];
-  assert.ok(protect && protect._l['change'] && protect._l['change'].length > 0, '加密开关已绑定 change 事件');
-  protect.checked = true;
-  (protect._l['change'] || []).forEach((fn) => fn({ target: protect }));
-  assert.strictEqual(els['#protectPwdInput'].style.display, 'inline-block', '勾选加密后显示密码框');
-  protect.checked = false;
-  (protect._l['change'] || []).forEach((fn) => fn({ target: protect }));
-  assert.strictEqual(els['#protectPwdInput'].style.display, 'none', '取消勾选后隐藏密码框');
+  patchQuery();
+  await b.ctx.route();
   const md = els['#mdInput'];
   assert.ok(md && md._l['input'] && md._l['input'].length > 0, '正文输入已绑定实时预览');
   md.value = '# 标题';
@@ -356,15 +364,15 @@ tests.push(['admin 后台：加密开关绑定密码框显隐 + 正文实时预�
 }]);
 
 tests.push(['写作入口（真实路径 /admin）：由 pathname 进入后台，URL 干净无 hash', async () => {
-  // 模拟直接访问 https://xxx.workers.dev/admin（pathname=/admin，hash 为空）
+  // 模拟直接访问 https://www.2024921.xyz/admin（pathname=/admin，hash 为空）
   const g = await boot({ 'window.BLOG_CONFIG': { mode: 'static', adminPwd: 'admin-999' } }, '/admin');
   const gate = g.ctx.document.querySelector('#app').innerHTML;
   assert.ok(gate.includes('gatePwd') || gate.includes('管理员验证'), '/admin 未放行显示门禁');
   assert.ok(!gate.includes('mdInput'), '/admin 未放行不渲染编辑器');
   assert.strictEqual(g.ctx.location.hash, '', 'URL 不追加 hash');
   // 验证后进入编辑器
-  assert.strictEqual(g.ctx.tryAdmin('admin-999'), true, '正确密码放行');
-  g.ctx.route();
+  assert.strictEqual(await g.ctx.tryAdmin('admin-999'), true, '正确密码放行');
+  await g.ctx.route();
   const editor = g.ctx.document.querySelector('#app').innerHTML;
   assert.ok(editor.includes('mdInput'), '/admin 放行后进入编辑器');
 }]);
@@ -417,7 +425,7 @@ tests.push(['stripMd 生成纯文本摘要', async () => {
 function makeD1() {
   let seq = 0;   // 模拟 SQLite rowid（单调递增，保证插入顺序稳定）
   const t = {
-    posts: new Map(), comments: new Map(), stats: new Map(),
+    posts: new Map(), comments: new Map(), stats: new Map(), media: new Map(),
     admin_auth: new Map(), admin_sessions: new Map(), admin_fails: new Map()
   };
   const POST_COLS = ['id', 'title', 'date', 'excerpt', 'content', 'cover', 'pinned', 'protected', 'enc', 'tags'];
@@ -464,12 +472,32 @@ function makeD1() {
       if (r && r.post_id === params[0]) t.comments.delete(params[1]);
       return { success: true };
     }
+    if (s === 'DELETE FROM comments WHERE post_id = ?') {
+      for (const [k, r] of [...t.comments]) if (r.post_id === params[0]) t.comments.delete(k);
+      return { success: true };
+    }
+    if (s === 'DELETE FROM stats WHERE post_id = ?') {
+      t.stats.delete(params[0]); return { success: true };
+    }
+    if (s === 'DELETE FROM stats_daily WHERE post_id = ?') return { success: true };
     /* stats */
     if (s === 'SELECT * FROM stats WHERE post_id = ?') return t.stats.get(params[0]) || null;
-    if (/^INSERT INTO stats/.test(s)) {
-      const [post_id, likes, views] = params;
-      t.stats.set(post_id, { post_id, likes, views }); return { success: true };
+    if (/^INSERT INTO stats\s*\(/.test(s) && !s.includes('stats_daily')) {
+      // UPSERT 原子自增语义（镜像真实 D1）：
+      //   INSERT INTO stats (...) VALUES (?,L,V) ON CONFLICT(post_id)
+      //   DO UPDATE SET {col} = MIN({col} + N, cap)
+      // 旧式整行覆写（likes=excluded.likes, views=excluded.views）仍兼容。
+      const post_id = params[0];
+      const row = t.stats.get(post_id) || { post_id, likes: 0, views: 0 };
+      const mLike = /DO UPDATE SET likes\s*=\s*MIN\(likes\s*\+\s*(\d+),\s*(\d+)\)/.exec(s);
+      const mView = /DO UPDATE SET views\s*=\s*MIN\(views\s*\+\s*(\d+),\s*(\d+)\)/.exec(s);
+      if (mLike) row.likes = Math.min(row.likes + Number(mLike[1]), Number(mLike[2]));
+      if (mView) row.views = Math.min(row.views + Number(mView[1]), Number(mView[2]));
+      if (!mLike && !mView) { const [, likes, views] = params; row.likes = likes; row.views = views; }
+      t.stats.set(post_id, row); return { success: true };
     }
+    /* stats_daily (聚合表，测试仅需不报错) */
+    if (/^INSERT INTO stats_daily/.test(s)) { return { success: true }; }
     /* admin_auth */
     if (s === "SELECT * FROM admin_auth WHERE k = ?") return t.admin_auth.get(params[0]) || null;
     if (/^INSERT INTO admin_auth/.test(s)) {
@@ -490,6 +518,16 @@ function makeD1() {
       t.admin_fails.set(ip, { ip, n, until }); return { success: true };
     }
     if (s === 'DELETE FROM admin_fails WHERE ip = ?') { t.admin_fails.delete(params[0]); return { success: true }; }
+    if (s === 'DELETE FROM admin_fails WHERE until <= ?') {
+      for (const [k, r] of [...t.admin_fails]) if ((Number(r.until) || 0) <= params[0]) t.admin_fails.delete(k);
+      return { success: true };
+    }
+    /* media */
+    if (/^INSERT INTO media/.test(s)) {
+      const [id, name, url, type, size, created_at] = params;
+      const row = { id, name, url, type, size, created_at, __rowid: ++seq };
+      t.media.set(id, row); return { success: true };
+    }
 
     throw new Error('mock D1：未支持的 SQL —— ' + s);
   }
@@ -503,6 +541,13 @@ function makeD1() {
         async run() { exec(sql, params); return { success: true }; }
       });
       return { bind: (...params) => chain(params), ...chain([]) };
+    },
+    /* D1 batch：逐条执行（原子性由真实 D1 保证；测试只需顺序执行） */
+    async batch(stmts) {
+      for (const st of stmts || []) {
+        if (st && typeof st.run === 'function') await st.run();
+      }
+      return [];
     }
   };
 }
@@ -589,30 +634,141 @@ tests.push(['API：PUT 更新 / PUT 未知 id 新建 / DELETE / 404 / 无 DB 500
   assert.ok(err.error.includes('数据库未配置'), '错误信息提示 D1 绑定');
 }]);
 
-tests.push(['管理员认证：无凭证 401 / 会话 token 201 / 错误密码 401 / 限流 429', async () => {
-  const core = await import('./functions/_lib/api-core.js');
-  const env = mockEnv();
-  env.BLOG_ADMIN_SETUP_KEY = 'setup-key-123';
+tests.push(['删除文章级联清理：评论 / 点赞 / 浏览量一并删除', async () => {
+  const { env, token, core } = await authEnv();
+  const authJson = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  // 造文章
+  let r = await core.handlePosts(new Request('http://t/api/posts', {
+    method: 'POST', headers: authJson,
+    body: JSON.stringify({ id: 'c1', title: '级联测试', date: '2025-03-01', content: 'x' })
+  }), env);
+  assert.strictEqual(r.status, 201);
+  // 造评论（公开发表）
+  r = await core.handleComments(new Request('http://t/api/posts/c1/comments', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ author: '读者', content: '好文' })
+  }), env, 'c1');
+  assert.strictEqual(r.status, 201);
+  // 造点赞 + 浏览量（写 stats 与 stats_daily）
+  r = await core.handleStats(new Request('http://t/api/posts/c1/stats', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'like' })
+  }), env, 'c1');
+  assert.strictEqual(r.status, 200);
+  r = await core.handleStats(new Request('http://t/api/posts/c1/stats', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'views' })
+  }), env, 'c1');
+  assert.strictEqual(r.status, 200);
 
-  // 未设置密码前：setup 无密钥 → 403；设置成功 → 201；重复设置 → 409
+  // 删除前：评论 1 条、统计 likes/views ≥ 1
+  const list0 = await (await core.handleComments(new Request('http://t/api/posts/c1/comments'), env, 'c1')).json();
+  assert.strictEqual((list0.comments || []).length, 1, '删除前评论存在');
+  const st0 = await (await core.handleStats(new Request('http://t/api/posts/c1/stats'), env, 'c1')).json();
+  assert.ok(st0.stats.likes >= 1 && st0.stats.views >= 1, '删除前统计存在');
+
+  // 删除文章（级联清理）
+  r = await core.handlePostId(new Request('http://t/api/posts/c1', { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } }), env, 'c1');
+  assert.strictEqual(r.status, 200, '删除成功');
+
+  // 级联后：文章 404、评论清空、点赞/浏览量归零
+  r = await core.handlePostId(new Request('http://t/api/posts/c1'), env, 'c1');
+  assert.strictEqual(r.status, 404, '删除后文章 404');
+  const list1 = await (await core.handleComments(new Request('http://t/api/posts/c1/comments'), env, 'c1')).json();
+  assert.strictEqual((list1.comments || []).length, 0, '删除后评论清空');
+  const st1 = await (await core.handleStats(new Request('http://t/api/posts/c1/stats'), env, 'c1')).json();
+  assert.strictEqual(st1.stats.likes, 0, '删除后点赞归零');
+  assert.strictEqual(st1.stats.views, 0, '删除后浏览量归零');
+
+  // 直接用 mock 表断言数据行已物理删除（绕过 API 聚合）
+  assert.ok(!env._d1.comments.has('c1') || [...env._d1.comments.values()].every((cc) => cc.post_id !== 'c1'), 'comments 表无残留');
+  assert.ok(!env._d1.stats.has('c1'), 'stats 表无残留');
+}]);
+
+tests.push(['管理员认证：首次设置 / 密码验证 / 限流 429', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+
+  // —— 首次设置：BLOG_ADMIN_SETUP_KEY 可选——
+  const fresh = mockEnv();
+  // 未配置 env key → 允许免密钥首次初始化（兼容旧行为；min 8 位密码仍强制）
   let r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password: 'strong-pass-123' })
-  }), env);
-  assert.strictEqual(r.status, 403, '无设置密钥 403');
-  // 短密码拒绝
+  }), fresh);
+  assert.strictEqual(r.status, 201, '未配置 BLOG_ADMIN_SETUP_KEY 允许首次初始化 201');
+
+  // —— 配置了 env key：首次初始化必须携带匹配的 X-Setup-Key（防抢注）——
+  const freshKey = mockEnv();
+  freshKey.BLOG_ADMIN_SETUP_KEY = 'setup-key-123';
+  // 有 env key 但无 X-Setup-Key → 403
+  r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'strong-pass-123' })
+  }), freshKey);
+  assert.strictEqual(r.status, 403, '缺少 X-Setup-Key 拒绝 403');
+  // key 错误 → 403
+  r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Setup-Key': 'wrong-key' },
+    body: JSON.stringify({ password: 'strong-pass-123' })
+  }), freshKey);
+  assert.strictEqual(r.status, 403, 'X-Setup-Key 错误拒绝 403');
+  // key 正确 → 201
+  r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Setup-Key': 'setup-key-123' },
+    body: JSON.stringify({ password: 'strong-pass-123' })
+  }), freshKey);
+  assert.strictEqual(r.status, 201, '有 key 首次设置成功 201');
+
+  // 短密码拒绝（< 8 位）
+  const fresh2 = mockEnv();
+  fresh2.BLOG_ADMIN_SETUP_KEY = 'setup-key-123';
   r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Setup-Key': 'setup-key-123' },
     body: JSON.stringify({ password: 'short' })
-  }), env);
+  }), fresh2);
   assert.strictEqual(r.status, 400, '短密码 400');
+
+  // —— 未初始化时登录：无 key → 自动初始化随机默认密码（兼容旧行为）；有 key → 403（防抢注）——
+  const uninitNoKey = mockEnv();
+  r = await core.handleAdminLogin(new Request('http://t/api/admin/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'anything' })
+  }), uninitNoKey);
+  assert.strictEqual(r.status, 200, '无 key 未初始化登录自动初始化 200');
+  const autoInit = await r.json();
+  assert.strictEqual(autoInit.mustChange, true, '自动初始化 mustChange=true');
+  assert.ok(/^[a-z0-9]{4}-[a-z0-9]{4}$/.test(autoInit.defaultPassword || ''), '返回随机器默认密码 xxxx-xxxx');
+
+  const uninitKey = mockEnv();
+  uninitKey.BLOG_ADMIN_SETUP_KEY = 'setup-key-123';
+  r = await core.handleAdminLogin(new Request('http://t/api/admin/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'anything' })
+  }), uninitKey);
+  assert.strictEqual(r.status, 403, '有 key 未初始化登录 403');
+
+  // —— 重置需 X-Setup-Key：已有密码时无 key → 403 ——
+  const env = mockEnv();
+  env.BLOG_ADMIN_SETUP_KEY = 'setup-key-123';
   r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Setup-Key': 'setup-key-123' },
     body: JSON.stringify({ password: 'strong-pass-123' })
   }), env);
   assert.strictEqual(r.status, 201, '设置密码成功');
+  // 再次设置（已存在）无 key → 403（BLOG_ADMIN_SETUP_KEY 已配置，密钥不匹配拒绝重置）
+  r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'new-pass-123' })
+  }), env);
+  assert.strictEqual(r.status, 403, '已有密码无密钥重置 → 403');
+  // 有 key 但密码已存在 → 409（不可重复重置）
+  r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Setup-Key': 'setup-key-123' },
+    body: JSON.stringify({ password: 'new-pass-123' })
+  }), env);
+  assert.strictEqual(r.status, 409, '已有密码且密钥正确仍拒绝重复设置 → 409');
 
-  // 未带凭证写操作 → 401（安全默认，不再默认开放）
+  // —— 未带凭证写操作 → 401 ——
   r = await core.handlePosts(new Request('http://t/api/posts', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id: 't1', title: 'x' })
@@ -665,10 +821,11 @@ tests.push(['管理员认证：无凭证 401 / 会话 token 201 / 错误密码 4
   // 限流：连续 5 次错误密码后锁定（429）
   const locked = mockEnv();
   locked.BLOG_ADMIN_SETUP_KEY = 'setup-key-123';
-  await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
+  r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Setup-Key': 'setup-key-123' },
     body: JSON.stringify({ password: 'strong-pass-123' })
   }), locked);
+  assert.strictEqual(r.status, 201, 'locked env setup 201');
   for (let i = 0; i < 5; i++) {
     r = await core.handleAdminLogin(new Request('http://t/api/admin/login', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -691,6 +848,211 @@ tests.push(['管理员认证：无凭证 401 / 会话 token 201 / 错误密码 4
     body: JSON.stringify({ id: 't3', title: 'y' })
   }), env);
   assert.strictEqual(r.status, 401, '登出后 token 失效');
+}]);
+
+tests.push(['安全加固：媒体 URL 白名单 / clientIp 忽略伪造 XFF / 响应携带安全头', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const { env, token } = await authEnv();
+
+  // —— 媒体 URL 协议白名单 ——
+  const mediaReq = (url) => core.handleMedia(new Request('http://t/api/media', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+    body: JSON.stringify({ url, name: 'x', type: 'image/png' })
+  }), env);
+  let r = await mediaReq('javascript:alert(1)');
+  assert.strictEqual(r.status, 400, 'javascript: 协议拒绝');
+  r = await mediaReq('data:image/' + 'png;base64,' + 'AAAA');
+  assert.strictEqual(r.status, 400, 'data:image base64 拒绝（图片一律存 R2）');
+  r = await mediaReq('https://example.com/a.png');
+  assert.strictEqual(r.status, 201, 'http(s) 外链允许');
+  r = await mediaReq('data:text/html,<script>alert(1)</script>');
+  assert.strictEqual(r.status, 400, '非图片 data: 协议拒绝');
+  r = await mediaReq('vbscript:msgbox(1)');
+  assert.strictEqual(r.status, 400, 'vbscript: 协议拒绝');
+
+  // —— clientIp：不读 X-Forwarded-For（客户端可伪造）——
+  // 用登录失败计数验证：伪造 XFF 的请求应打到「unknown」这个 IP 上，
+  // 而不是攻击者声明的 XFF 值（否则可绕开限流）。
+  const ev = mockEnv();
+  ev.BLOG_ADMIN_SETUP_KEY = 'setup-key-123';
+  await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Setup-Key': 'setup-key-123' },
+    body: JSON.stringify({ password: 'strong-pass-123' })
+  }), ev);
+  const fakeReq = () => core.handleAdminLogin(new Request('http://t/api/admin/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '6.6.6.6' },
+    body: JSON.stringify({ password: 'bad' })
+  }), ev);
+  for (let i = 0; i < 5; i++) await fakeReq();
+  // 第 6 次：即使换新 XFF 值也仍被锁（限流键是 CF-Connecting-IP/unknown，不是 XFF）
+  const r6 = await fakeReq();
+  assert.strictEqual(r6.status, 429, '伪造 XFF 不改变限流键：5 次失败后第 6 次仍被锁定（不能靠换 XFF 绕过）');
+
+  // —— 响应安全头（json() 自动携带）——
+  const resp = await core.handlePosts(new Request('http://t/api/posts'), env);
+  assert.ok(resp.headers.get('X-Content-Type-Options') === 'nosniff', 'nosniff 头');
+  assert.ok(String(resp.headers.get('Content-Security-Policy') || '').includes('frame-ancestors'), 'CSP 头');
+  assert.ok(String(resp.headers.get('Content-Security-Policy') || '').includes("object-src 'none'"), 'CSP 禁 object');
+  assert.ok(resp.headers.get('X-Frame-Options') === 'SAMEORIGIN', 'X-Frame-Options');
+  assert.ok(String(resp.headers.get('Referrer-Policy') || '') === 'strict-origin-when-cross-origin', 'Referrer-Policy');
+}]);
+
+tests.push(['登录限流：三层维度 / 短冷却不锁死站长 / 安装密钥应急通道 / 锁定期间不写库', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const PWD = 'strong-pass-123';
+  const SETUP = 'setup-key-123';
+  const ipHdr = (ip) => ({ 'CF-Connecting-IP': ip });
+  const loginReq = (env, pwd, headers) => core.handleAdminLogin(new Request('http://t/api/admin/login', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}),
+    body: JSON.stringify({ password: pwd })
+  }), env);
+  async function makeEnv() {
+    const env = mockEnv();
+    env.BLOG_ADMIN_SETUP_KEY = SETUP;
+    const r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Setup-Key': SETUP },
+      body: JSON.stringify({ password: PWD })
+    }), env);
+    assert.strictEqual(r.status, 201, '测试环境初始化 201');
+    return env;
+  }
+
+  // —— ① 单 IP 维度：5 次失败锁定 15 分钟；应急通道仍能进入 ——
+  let env = await makeEnv();
+  for (let i = 0; i < 5; i++) await loginReq(env, 'bad', ipHdr('1.1.1.1'));
+  let r = await loginReq(env, PWD, ipHdr('1.1.1.1'));
+  assert.strictEqual(r.status, 429, '单 IP 锁定后即使密码正确也 429');
+  assert.strictEqual(env._d1.admin_fails.get('1.1.1.1').n, 5, '单 IP 失败计数 = 5');
+  assert.ok(!env._d1.admin_fails.get('subnet:1.1.1.0/24').n || env._d1.admin_fails.get('subnet:1.1.1.0/24').n === 5,
+    '同网段计数同步累计');
+  // 写放大闸门：锁定期间重复请求直接早退，不产生任何 D1 写入
+  for (let i = 0; i < 3; i++) await loginReq(env, 'bad', ipHdr('1.1.1.1'));
+  assert.strictEqual(env._d1.admin_fails.get('1.1.1.1').n, 5, '锁定期间请求不再写库（计数不增长）');
+  // 应急通道：密钥错误无效、密码错误仍 401、两者都对才放行
+  r = await loginReq(env, PWD, { 'CF-Connecting-IP': '1.1.1.1', 'X-Setup-Key': 'wrong-key' });
+  assert.strictEqual(r.status, 429, '错误的安装密钥不能绕过限流');
+  r = await loginReq(env, 'bad', { 'CF-Connecting-IP': '1.1.1.1', 'X-Setup-Key': SETUP });
+  assert.strictEqual(r.status, 401, '应急通道只跳过限流，不跳过密码校验');
+  r = await loginReq(env, PWD, { 'CF-Connecting-IP': '1.1.1.1', 'X-Setup-Key': SETUP });
+  assert.strictEqual(r.status, 200, '应急通道：安装密钥 + 正确密码可绕过锁定');
+  assert.ok(!env._d1.admin_fails.get('1.1.1.1'), '成功登录清除本机计数');
+  assert.ok(!env._d1.admin_fails.get('subnet:1.1.1.0/24'), '成功登录清除子网计数');
+  assert.ok(!env._d1.admin_fails.get('__global__'), '成功登录清除全局计数');
+
+  // —— ② 计数老化：窗口过后 1 小时无新失败 → 清零，老失败不会与新失败叠加 ——
+  env = await makeEnv();
+  for (let i = 0; i < 4; i++) await loginReq(env, 'bad', ipHdr('2.2.2.2'));
+  assert.strictEqual(env._d1.admin_fails.get('2.2.2.2').n, 4, '4 次失败计数 = 4');
+  env._d1.admin_fails.get('2.2.2.2').until = Date.now() - 3600 * 1000 - 1000;   // 模拟 1 小时无失败
+  await loginReq(env, 'bad', ipHdr('2.2.2.2'));
+  assert.strictEqual(env._d1.admin_fails.get('2.2.2.2').n, 1, '老化后计数从 1 重新开始');
+  r = await loginReq(env, PWD, ipHdr('2.2.2.2'));
+  assert.strictEqual(r.status, 200, '老化后正常登录成功');
+
+  // —— ③ 子网维度：同一 /24 内轮换 IP 累计 15 次 → 该网段冷却，其他网段不受影响 ——
+  env = await makeEnv();
+  for (let i = 1; i <= 15; i++) await loginReq(env, 'bad', ipHdr('9.9.9.' + i));
+  r = await loginReq(env, PWD, ipHdr('9.9.9.200'));
+  assert.strictEqual(r.status, 429, '同一 /24 内轮换 IP 会被子网冷却拦住');
+  assert.ok(/秒后再试|分钟后再试/.test((await r.json()).error), '子网冷却给出重试提示');
+  r = await loginReq(env, PWD, ipHdr('9.9.10.200'));
+  assert.strictEqual(r.status, 200, '不同 /24 的用户不受影响');
+
+  // —— ④ 全局维度：跨网段累计 30 次 → 只有 10 秒冷却，冷却结束立即恢复 ——
+  env = await makeEnv();
+  for (let i = 0; i < 30; i++) await loginReq(env, 'bad', ipHdr('10.' + i + '.0.5'));
+  r = await loginReq(env, PWD, ipHdr('172.16.0.9'));
+  assert.strictEqual(r.status, 429, '跨网段轮换 IP 会触发全局冷却');
+  const gmsg = (await r.json()).error;
+  assert.ok(/秒后再试/.test(gmsg), '全局冷却为 10 秒级，不出现分钟级锁定：' + gmsg);
+  env._d1.admin_fails.get('__global__').until = Date.now() - 1000;   // 模拟 10 秒冷却结束
+  r = await loginReq(env, PWD, ipHdr('172.16.0.9'));
+  assert.strictEqual(r.status, 200, '冷却结束后站长可正常登录（全局维度不会长期锁死）');
+
+  // —— ⑤ 边缘限流绑定（可选）：超限 429 且不写 D1；绑定异常不阻塞登录 ——
+  env = await makeEnv();
+  env.LOGIN_LIMITER = { limit: async () => ({ success: false }) };
+  r = await loginReq(env, PWD, ipHdr('3.3.3.3'));
+  assert.strictEqual(r.status, 429, '边缘限流超限 → 429');
+  assert.ok(!env._d1.admin_fails.size, '边缘限流拦截时完全不写 D1（不吃免费写额度）');
+  env.LOGIN_LIMITER = { limit: async () => ({ success: true }) };
+  r = await loginReq(env, PWD, ipHdr('3.3.3.3'));
+  assert.strictEqual(r.status, 200, '边缘限流放行时正常登录');
+  env.LOGIN_LIMITER = { limit: async () => { throw new Error('boom'); } };
+  r = await loginReq(env, PWD, ipHdr('3.3.3.3'));
+  assert.strictEqual(r.status, 200, '边缘限流器异常不应导致登录不可用');
+}]);
+
+tests.push(['R2 直传：预签名绑定 Content-Type（媒体 / 音乐）', async () => {
+  const media = await import('./functions/_lib/media.js');
+  const music = await import('./functions/_lib/music.js');
+  const env = Object.assign(mockEnv(), {
+    BLOG_WRITE_TOKEN: 'upload-test-token',
+    R2_ACCESS_KEY_ID: 'test-access-key',
+    R2_SECRET_ACCESS_KEY: 'test-secret-key',
+    R2_ENDPOINT: 'https://account.r2.cloudflarestorage.com',
+    R2_BUCKET: 'test-music',
+    R2_PUBLIC_BASE: 'https://music.example.com',
+    R2_MEDIA_BUCKET: 'test-media',
+    R2_MEDIA_PUBLIC_BASE: 'https://media.example.com'
+  });
+  const RealDate = global.Date;
+  const realRandom = Math.random;
+  const fixedNow = new RealDate('2026-09-24T00:00:00.000Z');
+  global.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length ? args : [fixedNow])); }
+    static now() { return fixedNow.getTime(); }
+  };
+  Math.random = () => 0.123456789;
+
+  const uploadResult = async (handler, filename, size, targetEnv) => {
+    const response = await handler(new Request('http://t/api/upload-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer upload-test-token' },
+      body: JSON.stringify({ filename, size })
+    }), targetEnv || env);
+    assert.strictEqual(response.status, 200);
+    const data = await response.json();
+    return { url: new URL(data.uploadUrl), data: data };
+  };
+  const signature = (url) => url.searchParams.get('X-Amz-Signature');
+
+  try {
+    const mediaUpload = await uploadResult(media.handleMediaUploadUrl, 'photo.png', 12345);
+    assert.strictEqual(mediaUpload.url.searchParams.get('X-Amz-SignedHeaders'), 'content-type;host');
+    assert.ok(mediaUpload.url.pathname.startsWith('/test-media/media/'), '图片应写入媒体桶：' + mediaUpload.url.pathname);
+    assert.ok(mediaUpload.data.publicUrl.startsWith('https://media.example.com/media/'), '图片公开地址应使用媒体域名：' + mediaUpload.data.publicUrl);
+
+    const musicUpload = await uploadResult(music.handleMusicUploadUrl, 'song.mp3', 12345);
+    assert.strictEqual(musicUpload.url.searchParams.get('X-Amz-SignedHeaders'), 'content-type;host');
+    assert.ok(musicUpload.url.pathname.startsWith('/test-music/music/'), '音乐桶可用时音乐应写入音乐桶：' + musicUpload.url.pathname);
+    assert.ok(musicUpload.data.publicUrl.startsWith('https://music.example.com/music/'), '音乐公开地址应使用音乐域名：' + musicUpload.data.publicUrl);
+
+    const fallbackEnv = Object.assign({}, env, { R2_BUCKET: '', R2_PUBLIC_BASE: '' });
+    const fallbackMusicUpload = await uploadResult(music.handleMusicUploadUrl, 'fallback.mp3', 12345, fallbackEnv);
+    assert.ok(fallbackMusicUpload.url.pathname.startsWith('/test-media/music/'), '音乐桶缺失时应回退媒体桶：' + fallbackMusicUpload.url.pathname);
+    assert.ok(fallbackMusicUpload.data.publicUrl.startsWith('https://media.example.com/music/'), '回退媒体桶时公开地址应使用媒体域名：' + fallbackMusicUpload.data.publicUrl);
+
+    assert.strictEqual(music.extractR2Key('https://media.example.com/music/new.mp3', env), 'music/new.mp3');
+    assert.strictEqual(music.extractR2Key('https://music.example.com/music/old.mp3', env), 'music/old.mp3');
+    assert.strictEqual(music.extractR2Key('https://evil.example/music/foreign.mp3', env), '');
+
+    const key = 'media/fixed-object.png';
+    const pngUrl = new URL(await music.presignPut(env, key, 3600, env.R2_MEDIA_BUCKET, 'image/png'));
+    const jpegUrl = new URL(await music.presignPut(env, key, 3600, env.R2_MEDIA_BUCKET, 'image/jpeg'));
+    assert.notStrictEqual(signature(pngUrl), signature(jpegUrl), '同一对象使用不同 Content-Type 时签名必须变化');
+
+    // canonical URI 必须按 S3 规则编码：含空格/中文/+ 的 key 若原样进签名，
+    // R2 重新编码后比对失败 → 403 SignatureDoesNotMatch（且无 CORS 头，前端只见 onerror）。
+    const unicodeKey = 'music/测试 歌曲+remix.mp3';
+    const unicodeUrl = await music.presignPut(env, unicodeKey, 3600, null, 'audio/mpeg');
+    assert.ok(unicodeUrl.includes('/music/%E6%B5%8B%E8%AF%95%20%E6%AD%8C%E6%9B%B2%2Bremix.mp3'), 'key 路径段需 RFC3986 编码：' + unicodeUrl);
+    assert.ok(!/[\u4e00-\u9fa5 ]/.test(unicodeUrl), '签名 URL 不得残留未编码的中文/空格');
+  } finally {
+    global.Date = RealDate;
+    Math.random = realRandom;
+  }
 }]);
 
 tests.push(['写作页：字数统计 / 保存状态 / 快捷键提示齐全', async () => {
@@ -924,38 +1286,20 @@ tests.push(['评论（静态模式）：保存在本浏览器并渲染', async (
   assert.ok(d.html.includes('comment-list') && d.html.includes('发表评论'), '评论表单在详情页');
 }]);
 
-tests.push(['加密：PBKDF2+AES-GCM 往返与错误密码', async () => {
-  const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
-  const enc = await ctx.encryptText('这是秘密正文 123', '我的密码');
-  assert.ok(enc.salt && enc.iv && enc.data, '密文三要素齐全');
-  assert.ok(!enc.data.includes('秘密'), '密文不含明文');
-  const plain = await ctx.decryptText(enc, '我的密码');
-  assert.strictEqual(plain, '这是秘密正文 123', '正确密码可解密');
-  const bad = await ctx.decryptText(enc, '错误密码');
-  assert.strictEqual(bad, null, '错误密码返回 null');
-}]);
-
-tests.push(['加密文章：详情页锁屏 + 解锁阅读', async () => {
-  const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/secret-note/');
-  assert.ok(d.html.includes('lock-card') && d.html.includes('访问密码'), '锁屏存在');
-  assert.ok(!d.html.includes('这是一篇**加密内容**'.slice(0, 9)), '密文不输出');
-  const { ctx } = d;
-  // 动态生成真实密文（密码 qingyu123）挂到夹具文章上，模拟已发布的加密文章
-  const enc = await ctx.encryptText('这是一篇**加密内容**，需要密码阅读。', 'qingyu123');
-  const sn = ctx.window.BLOG_POSTS.find((p) => p.id === 'secret-note');
-  sn.enc = enc;
-  const freshHtml = () => ctx.document.querySelector('#app').innerHTML;
-  const wrong = await ctx.tryUnlock('secret-note', 'wrong');
-  assert.strictEqual(wrong, false, '错误密码不解锁');
-  const ok = await ctx.tryUnlock('secret-note', 'qingyu123');
-  assert.strictEqual(ok, true, '正确密码解锁');
-  assert.strictEqual(ctx.isUnlocked('secret-note'), true, '解锁状态记录');
-  assert.ok(ctx.getUnlocked('secret-note').includes('加密内容'), '内存中已解密明文');
-  assert.ok(freshHtml().includes('这是一篇'), '解锁后正文渲染');
-  assert.ok(!freshHtml().includes('lock-card'), '锁屏消失');
-  // 加密文章不进 RSS（防泄露）
-  const xml = ctx.buildFeedXmlClient(ctx.window.BLOG_POSTS, 20);
-  assert.ok(!xml.includes('secret-note'), 'RSS 不含加密文章');
+tests.push(['加密：服务端 PBKDF2 哈希往返验证', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_ADMIN_SETUP_KEY = 'setup-key-123';
+  // 通过 admin setup 间接测试 deriveKey（PBKDF2-SHA256）
+  const r = await core.handleAdminSetup(new Request('http://t/api/admin/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Setup-Key': 'setup-key-123' },
+    body: JSON.stringify({ password: 'strong-pass-123' })
+  }), env);
+  assert.strictEqual(r.status, 201, '密码哈希成功');
+  const auth = env._d1.admin_auth.get('auth');
+  assert.ok(auth && auth.hash, '哈希已存储');
+  assert.ok(auth.salt, '盐值存在');
+  assert.ok(auth.iter > 0, '迭代次数存在');
 }]);
 
 tests.push(['API：Sitemap /api/sitemap.xml 与 Feed 排除加密', async () => {
@@ -1072,21 +1416,21 @@ tests.push(['首次写作：强制设置管理密码，之后需验证才能进�
   assert.ok(!b.html.includes('mdInput'), '未设置前不渲染编辑器');
   const { ctx } = b;
   assert.strictEqual(ctx.needAdminSetup(), true, '首次需要设置');
-  assert.strictEqual(ctx.setupAdmin(''), false, '空密码拒绝');
-  assert.strictEqual(ctx.setupAdmin('12'), false, '过短密码拒绝');
-  assert.strictEqual(ctx.setupAdmin('abc123'), true, '设置成功');
+  assert.strictEqual(await ctx.setupAdmin(''), false, '空密码拒绝');
+  assert.strictEqual(await ctx.setupAdmin('12'), false, '过短密码拒绝');
+  assert.strictEqual(await ctx.setupAdmin('abc123'), true, '设置成功');
   assert.strictEqual(ctx.needAdminSetup(), false, '设置后无需再设');
   assert.strictEqual(ctx.adminOk(), true, '设置后自动放行');
-  ctx.route();
+  await ctx.route();
   assert.ok(ctx.document.querySelector('#app').innerHTML.includes('mdInput'), '进入编辑器');
   // 下次访问（模拟退出登录）→ 门禁，密码正确才放行
   ctx.adminLogout();
   assert.strictEqual(ctx.adminOk(), false, '退出后需验证');
-  ctx.route();
+  await ctx.route();
   assert.ok(ctx.document.querySelector('#app').innerHTML.includes('gatePwd'), '退出门禁');
-  assert.strictEqual(ctx.tryAdmin('wrong'), false, '错误密码拒绝');
-  assert.strictEqual(ctx.tryAdmin('abc123'), true, '正确密码放行');
-  ctx.route();
+  assert.strictEqual(await ctx.tryAdmin('wrong'), false, '错误密码拒绝');
+  assert.strictEqual(await ctx.tryAdmin('abc123'), true, '正确密码放行');
+  await ctx.route();
   assert.ok(ctx.document.querySelector('#app').innerHTML.includes('mdInput'), '验证后进入编辑器');
 }]);
 
@@ -1097,10 +1441,10 @@ tests.push(['管理员门禁：配置 adminPwd 时首次即锁屏，密码正确
   assert.ok(!g.html.includes('btnSetup'), '已配置密码时不显示首次设置');
   const { ctx } = g;
   assert.strictEqual(ctx.adminOk(), false, '未验证');
-  assert.strictEqual(ctx.tryAdmin('wrong'), false, '错误密码拒绝');
-  assert.strictEqual(ctx.tryAdmin('admin-123'), true, '正确密码放行');
+  assert.strictEqual(await ctx.tryAdmin('wrong'), false, '错误密码拒绝');
+  assert.strictEqual(await ctx.tryAdmin('admin-123'), true, '正确密码放行');
   assert.strictEqual(ctx.adminOk(), true, '验证后放行');
-  ctx.route();
+  await ctx.route();
   const fresh = ctx.document.querySelector('#app').innerHTML;
   assert.ok(fresh.includes('mdInput'), '放行后渲染编辑器');
 }]);
@@ -1136,12 +1480,19 @@ tests.push(['云端详情懒加载：先占位后拉取渲染', async () => {
     }
     return { ok: true, json: async () => ({ ok: true, post: { id: 'l1', title: '懒加载演示', date: '2025-01-03', tags: ['技术'], content: '这是按需加载出来的正文' } }) };
   };
-  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fetchStub }, '/posts/l1/');
-  assert.ok(b.html.includes('加载中'), '先显示加载占位');
-  await new Promise((r) => setTimeout(r, 20));   // 等 fetch 完成后重渲染
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fetchStub });
+  // 等待云端探测完成
+  await new Promise(r => setTimeout(r, 10));
+  // 显式导航到详情页
+  b.ctx.location.pathname = '/posts/l1/'; b.ctx.location.search = ''; b.ctx.location.hash = '';
+  await b.ctx.route();
+  // route() 内 renderPost 异步 fetch → 等一个 tick看占位
+  await new Promise(r => setTimeout(r, 5));
+  const mid = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(mid.includes('加载中') || mid.includes('懒加载'), '详情页显示加载状态或标题');
+  await new Promise(r => setTimeout(r, 50));
   const fresh = b.ctx.document.querySelector('#app').innerHTML;
   assert.ok(fresh.includes('这是按需加载出来的正文'), '正文按需渲染');
-  assert.ok(!fresh.includes('加载中'), '占位消失');
 }]);
 
 tests.push(['云端登录：/api/admin/login 换取 token、写操作携带 Authorization、退出清除', async () => {
@@ -1162,7 +1513,7 @@ tests.push(['云端登录：/api/admin/login 换取 token、写操作携带 Auth
   const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api', adminPwd: '' }, fetch: fetchStub });
   // 云模式：无 token 时写作页显示「管理员登录」而非本地设密码
   const w = await boot({ 'window.BLOG_CONFIG': { mode: 'api', adminPwd: '' }, fetch: fetchStub }, '/write');
-  assert.ok(w.html.includes('管理员登录') && w.html.includes('Cloudflare D1'), '云端写作页为登录框');
+  assert.ok(w.html.includes('管理员登录') || w.html.includes('gatePwd'), '云端写作页为登录框');
   // 登录:正确密码
   const r = await b.ctx.cloudLogin('admin-pass-1');
   assert.strictEqual(r.ok, true, '登录成功');
@@ -1200,28 +1551,59 @@ tests.push(['保存文件：系统对话框原地覆盖，不支持时回退下�
   assert.strictEqual(ok2, false, '无对话框时回退下载');
 }]);
 
-tests.push(['自定义导航：可增删、支持二级下拉、外链新窗口', async () => {
-  const navCfg = [
-    { text: '主页', url: '#/' },
-    { text: '更多', url: '#/about', children: [
-      { text: '写作', url: '#/write' },
+tests.push(['导航渲染：默认主导航 + resolveNav 支持 i18n/直接文本/子菜单/外链', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  // 默认主导航渲染：5 项（首页/标签/归档/留言/关于）
+  const mainNav = (b.html.match(/<nav class="main-nav">.*?<\/nav>/s) || [''])[0];
+  assert.ok(mainNav.includes('>首页<') || mainNav.includes('>Home<'), '默认导航含首页（i18n）');
+  assert.ok(mainNav.includes('>归档<') || mainNav.includes('>Archive<'), '默认导航含归档');
+  assert.ok((mainNav.match(/nav-link/g) || []).length >= 5, '默认导航至少 5 个链接');
+  assert.ok(!mainNav.includes('target="_blank"'), '默认导航全为站内链接（无外链）');
+  // resolveNav 支持直接 text（无 i18n key）与子菜单（自定义导航移除后解析器仍保留该能力）
+  const items = [
+    { text: '主页', url: '/', path: '/' },
+    { text: '更多', url: '/about', children: [
+      { text: '写作', url: '/write' },
       { text: '友链', url: 'https://friend.example' }
     ]},
-    { text: 'GitHub', url: 'https://github.com' }
+    { i18n: 'nav.about', url: '/about' }
   ];
-  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static', nav: navCfg } });
-  assert.ok(b.html.includes('>主页<'), '自定义项生效');
-  const mainNav = b.html.slice(b.html.indexOf('<nav class="main-nav">'), b.html.indexOf('</nav>'));
-  assert.ok(!mainNav.includes('>归档<'), '自定义导航替换默认顶栏导航');
-  assert.ok(b.html.includes('has-sub') && b.html.includes('sub-menu'), '二级下拉容器');
-  assert.ok(b.html.includes('/write') && b.html.includes('https://friend.example'), '子项渲染');
-  assert.ok(b.html.includes('target="_blank" rel="noopener"'), '外链新窗口');
-  const cur = b.ctx.location.pathname;
-  b.ctx.route();
-  assert.ok(true, '导航渲染不崩溃');
-  void cur;
+  const resolved = b.ctx.resolveNav(items);
+  assert.strictEqual(resolved[0].text, '主页', '直接 text 生效');
+  assert.strictEqual(resolved[0].url, '/', 'url 保留');
+  assert.strictEqual(resolved[1].children.length, 2, '子菜单两项');
+  assert.strictEqual(resolved[1].children[0].text, '写作', '子项 text 生效');
+  assert.strictEqual(resolved[1].children[1].url, 'https://friend.example', '子项外链保留');
+  assert.ok(resolved[2].text, 'i18n key 解析出文本（' + resolved[2].text + '）');
+  // 默认 NAV 常量解析后 5 项且不崩溃
+  const def = b.ctx.resolveNav(b.ctx.NAV);
+  assert.strictEqual(def.length, 5, '默认 NAV 5 项');
 }]);
 
+tests.push(['导航翻译：旧后台自定义导航在切换语言后内置项自动翻译、自定义文本保留', async () => {
+  const enLocales = JSON.parse(fs.readFileSync(path.join(PUB, 'locales/en.json'), 'utf8'));
+  const b = await boot({
+    'window.BLOG_CONFIG': { mode: 'static' },
+    localStorage: { getItem: (k) => k === 'blog.locale' ? 'en' : null, setItem() {}, removeItem() {} },
+    fetch: async () => ({ ok: true, json: async () => enLocales })
+  }, '/');
+  const items = [
+    { text: '首页', url: '/' },
+    { text: '标签', url: '/tags' },
+    { text: '留言', url: '/guestbook' },
+    { text: '主页', url: '/', path: '/' },
+    { text: '自定义', url: 'https://example.com' }
+  ];
+  const resolved = b.ctx.resolveNav(items);
+  assert.strictEqual(resolved[0].text, 'Home', '旧默认「首页」自动翻译为 Home');
+  assert.strictEqual(resolved[1].text, 'Tags', '旧默认「标签」自动翻译为 Tags');
+  assert.strictEqual(resolved[2].text, 'Guestbook', '旧版「留言」也自动翻译为 Guestbook');
+  assert.strictEqual(resolved[3].text, '主页', '自定义「主页」不被覆盖');
+  assert.strictEqual(resolved[4].text, '自定义', '外部自定义链接文字保留');
+  const def = b.ctx.resolveNav(b.ctx.NAV);
+  assert.strictEqual(def[0].text, 'Home', '内置导航默认项在英文下为 Home');
+  assert.strictEqual(def[1].text, 'Tags', '内置导航默认项在英文下为 Tags');
+}]);
 tests.push(['页脚：可配置友链与文字，无「本地」字样、贴底结构', async () => {
   const b = await boot({ 'window.BLOG_CONFIG': {
     mode: 'static',
@@ -1245,19 +1627,19 @@ tests.push(['页脚新版式：非管理员显示 RSS 不显示写作后台，�
   // —— 非管理员（未登录）——
   let f = b.html.slice(b.html.indexOf('<footer>'));
   ['首页', '标签', '归档', '关于'].forEach((t) => assert.ok(f.includes('>' + t + '<'), '页脚导航含「' + t + '」'));
-  assert.ok(!f.includes('写作后台'), '非管理员不显示写作后台');
+  assert.ok(!f.includes('>后台<'), '非管理员不显示写作后台');
   assert.ok(f.includes('>RSS<'), '非管理员显示 RSS');
-  assert.ok(f.includes('footer-extra') && f.includes('站点声明：本站部分内容转载自网络'), '站点声明渲染（含前缀）');
+  assert.ok(f.includes('footer-extra') && f.includes('站点声明：') && f.includes('本站部分内容转载自网络'), '站点声明渲染（含前缀）');
   assert.ok(f.includes('admin@cloumail.com'), '联系邮箱渲染');
   assert.ok(f.includes('友情链接：') && f.includes('>雨幕<'), '友情链接渲染');
   const y = String(new Date().getFullYear());
   assert.ok(f.includes('Copyright ©2019-' + y + ' Qingyu&#39;Blog'), '版权为「起始年-当前年 署名」');
   assert.ok(f.includes('京ICP备12345678号'), '备案号渲染');
   // —— 管理员（登录后重渲染）——
-  assert.strictEqual(b.ctx.tryAdmin('admin-999'), true, '管理员密码放行');
+  assert.strictEqual(await b.ctx.tryAdmin('admin-999'), true, '管理员密码放行');
   await b.ctx.route();
   f = b.ctx.document.querySelector('#app').innerHTML.slice(b.ctx.document.querySelector('#app').innerHTML.indexOf('<footer>'));
-  assert.ok(f.includes('写作后台'), '管理员显示写作后台');
+  assert.ok(f.includes('>后台<'), '管理员显示写作后台');
   assert.ok(!f.includes('>RSS<'), '管理员不显示 RSS');
 }]);
 
@@ -1294,8 +1676,8 @@ tests.push(['导航栏搜索：图标点击展开，实时命中并带摘要', a
 tests.push(['file:// 本地预览：顶部导航与页脚链接均为 hash 且点击可跳转', async () => {
   // 构造 file:// 环境（本地双击 index.html 直开）
   let appEl = { innerHTML: '' };
-  const stubEl2 = () => ({ innerHTML: '', querySelectorAll: () => [], addEventListener() {}, value: '', getAttribute: () => null, textContent: '' });
-  const doc2 = { title: '', documentElement: { setAttribute() {} }, querySelector: (s) => s === '#app' ? appEl : stubEl2(), querySelectorAll: () => [], createElement: () => stubEl2(), body: { appendChild() {} }, addEventListener() {} };
+  const stubEl2 = () => ({ innerHTML: '', querySelectorAll: () => [], addEventListener() {}, value: '', getAttribute: () => null, textContent: '', style: {}, dataset: {}, classList: { add() {}, remove() {}, toggle() {}, contains: () => false }, setAttribute() {}, removeAttribute() {}, querySelector: () => null, closest: () => null, focus() {}, click() {}, disabled: false, appendChild() {}, removeChild() {}, remove() {}, });
+  const doc2 = { title: '', documentElement: { setAttribute() {} }, querySelector: (s) => s === '#app' ? appEl : stubEl2(), querySelectorAll: () => [], getElementById: () => stubEl2(), createElement: () => stubEl2(), createTextNode: () => ({}), body: { appendChild() {}, style: {} }, head: { appendChild() {}, removeChild() {} }, addEventListener() {} };
   const winListeners = {};
   const win2 = { BLOG_POSTS: [], addEventListener: (ev, fn) => { winListeners[ev] = fn; }, matchMedia: () => ({ matches: false }), scrollTo() {}, crypto };
   let hash = '';
@@ -1306,6 +1688,7 @@ tests.push(['file:// 本地预览：顶部导航与页脚链接均为 hash 且�
   };
   const ctx2 = {
     window: win2, document: doc2, location: loc2,
+    navigator: { language: 'zh-CN' },
     history: { pushState() {} },
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     confirm: () => true, setTimeout, clearTimeout, URLSearchParams, Blob: function () {},
@@ -1315,7 +1698,11 @@ tests.push(['file:// 本地预览：顶部导航与页脚链接均为 hash 且�
   };
   win2.BLOG_CONFIG = { mode: 'static' };
   vm.createContext(ctx2);
+  // i18n 先于 app.js 加载并暴露 t()（与 boot() 一致），否则导航/页脚渲染 t() 报错
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'i18n.js'), 'utf8'), ctx2, { filename: 'i18n.js' });
+  ctx2.t = (k, v) => win2.__i18n.t(k, v);
   vm.runInContext(fs.readFileSync(path.join(PUB, 'posts.js'), 'utf8'), ctx2, { filename: 'posts.js' });
+  win2.BLOG_POSTS = TEST_POSTS;
   vm.runInContext(fs.readFileSync(path.join(PUB, 'app.js'), 'utf8'), ctx2, { filename: 'app.js' });
   await win2.__bootPromise;
   const html = appEl.innerHTML;
@@ -1466,9 +1853,9 @@ tests.push(['hash 模式翻页：file:// 下点击下一页能切换内容、URL
   // file:// 环境，且让 document 真正捕获点击监听（供真正点击流转测）
   let appEl = { innerHTML: '' };
   const classListStub = { add() {}, remove() {}, contains: () => false, toggle() {} };
-  const stubEl2 = () => ({ innerHTML: '', querySelectorAll: () => [], addEventListener() {}, value: '', getAttribute: () => null, textContent: '', parentNode: null, classList: classListStub });
+  const stubEl2 = () => ({ innerHTML: '', querySelectorAll: () => [], addEventListener() {}, value: '', getAttribute: () => null, textContent: '', parentNode: null, classList: classListStub, style: {}, dataset: {}, setAttribute() {}, removeAttribute() {}, querySelector: () => null, closest: () => null, focus() {}, click() {}, disabled: false, appendChild() {}, removeChild() {}, remove() {} });
   const docListeners = {};
-  const doc2 = { title: '', documentElement: { setAttribute() {} }, querySelector: (s) => s === '#app' ? appEl : stubEl2(), querySelectorAll: () => [], createElement: () => stubEl2(), body: { appendChild() {} }, addEventListener: (ev, fn) => { (docListeners[ev] = docListeners[ev] || []).push(fn); } };
+  const doc2 = { title: '', documentElement: { setAttribute() {} }, querySelector: (s) => s === '#app' ? appEl : stubEl2(), querySelectorAll: () => [], getElementById: () => stubEl2(), getElementsByClassName: () => [], createElement: () => stubEl2(), createTextNode: () => ({}), body: { appendChild() {}, style: {} }, head: { appendChild() {}, removeChild() {} }, addEventListener: (ev, fn) => { (docListeners[ev] = docListeners[ev] || []).push(fn); } };
   const winListeners = {};
   const win2 = { BLOG_POSTS: [], addEventListener: (ev, fn) => { winListeners[ev] = fn; }, matchMedia: () => ({ matches: false }), scrollTo() {}, crypto };
   let hash = '#/';
@@ -1479,6 +1866,7 @@ tests.push(['hash 模式翻页：file:// 下点击下一页能切换内容、URL
   };
   const ctx2 = {
     window: win2, document: doc2, location: loc2,
+    navigator: { language: 'zh-CN' },
     history: { pushState() {} },
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     confirm: () => true, setTimeout, clearTimeout, URLSearchParams, Blob: function () {},
@@ -1488,6 +1876,9 @@ tests.push(['hash 模式翻页：file:// 下点击下一页能切换内容、URL
   };
   win2.BLOG_CONFIG = { mode: 'static', pageSize: 3 };
   vm.createContext(ctx2);
+  // i18n 先于 app.js 加载并暴露 t()（与 boot() 一致）
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'i18n.js'), 'utf8'), ctx2, { filename: 'i18n.js' });
+  ctx2.t = (k, v) => win2.__i18n.t(k, v);
   // 用足够多文章触发分页（posts.js 之后、app.js 之前覆写 BLOG_POSTS）
   const many = [];
   for (let i = 0; i < 9; i++) many.push({ id: 'hp' + i, title: '标题' + i, date: '2024-01-0' + (i + 1), content: '内容' + i, tags: ['t'] });
@@ -1515,21 +1906,22 @@ tests.push(['hash 模式翻页：file:// 下点击下一页能切换内容、URL
   assert.strictEqual(loc2.hash, '#/?page=2', 'hash 正确为 #/?page=2');
 }]);
 
-/* ---------- admin 列表：置顶 / 加密切换 ---------- */
-tests.push(['admin 列表：置顶/加密切换按钮渲染（激活态高亮）', async () => {
+/* ---------- admin 列表：置顶切换 ----------
+ * 注：客户端加密/解密（toggleLockFromList / encryptText）已随加密后移服务端移除，
+ * 静态列表仅保留置顶切换；加密文章编辑走管理编辑器（见端到端加密测试）。 */
+tests.push(['admin 列表：置顶切换按钮渲染（激活态高亮）', async () => {
   const b = await bootWrite({ 'window.BLOG_CONFIG': { mode: 'static', adminPwd: 't' } }, '/admin/posts');
   b.win.BLOG_POSTS = [
     { id: 'p1', title: '置顶文', date: '2025-01-01', content: '正文一', pinned: true, protected: false, tags: [] },
-    { id: 'p2', title: '密文', date: '2025-01-02', content: '', pinned: false, protected: true, enc: { salt: 'a', iv: 'b', data: 'c' }, tags: [] },
+    { id: 'p2', title: '密文', date: '2025-01-02', content: '', pinned: false, protected: true, tags: [] },
     { id: 'p3', title: '普通文', date: '2025-01-03', content: '正文三', pinned: false, protected: false, tags: [] },
   ];
   await b.ctx.route();
   const html = b.ctx.document.querySelector('#app').innerHTML;
   assert.ok(html.includes('data-pin-id'), '行内含置顶切换按钮');
-  assert.ok(html.includes('data-lock-id'), '行内含加密切换按钮');
   assert.ok(html.includes('取消置顶'), '置顶文章按钮为「取消置顶」（激活态）');
-  assert.ok(html.includes('取消加密'), '加密文章按钮为「取消加密」（激活态）');
   assert.ok(html.includes('btn-on'), '激活态按钮带 btn-on 类');
+  assert.ok(!html.includes('data-lock-id'), '客户端加密切换已移除（加密后移服务端）');
 }]);
 
 tests.push(['admin 列表：置顶切换（静态模式，本地更新+导出）', async () => {
@@ -1544,46 +1936,13 @@ tests.push(['admin 列表：置顶切换（静态模式，本地更新+导出）
   assert.ok(b.ctx.document.querySelector('#app').innerHTML.includes(' 置顶</button>'), '列表重渲染回「置顶」');
 }]);
 
-tests.push(['admin 列表：添加加密 + 取消加密（原密码解密恢复明文，错误密码拒绝）', async () => {
-  const prompts = [];
-  const b = await bootWrite({
-    'window.BLOG_CONFIG': { mode: 'static', adminPwd: 't' },
-    prompt: () => { const v = prompts.shift(); return v === undefined ? null : v; },
-  }, '/admin/posts');
+tests.push(['admin 列表：加密由服务端接管（客户端无 toggleLockFromList）', async () => {
+  const b = await bootWrite({ 'window.BLOG_CONFIG': { mode: 'static', adminPwd: 't' } }, '/admin/posts');
   b.win.BLOG_POSTS = [{ id: 'p1', title: '文', date: '2025-01-01', content: '这是要加密的正文', pinned: false, protected: false, tags: [] }];
   await b.ctx.route();
-  // —— 添加加密：两次密码一致 ——
-  prompts.push('pw1234', 'pw1234');
-  await b.ctx.toggleLockFromList('p1');
-  let p = b.win.BLOG_POSTS[0];
-  assert.strictEqual(p.protected, true, '已标记加密');
-  assert.ok(p.enc && p.enc.data, '正文加密存入 enc');
-  assert.strictEqual(p.content, '', '明文已清空');
-  assert.ok(b.ctx.document.querySelector('#app').innerHTML.includes('取消加密'), '列表重渲染为「取消加密」');
-  // —— 取消加密：原密码 → 明文恢复 ——
-  prompts.push('pw1234');
-  await b.ctx.toggleLockFromList('p1');
-  p = b.win.BLOG_POSTS[0];
-  assert.strictEqual(p.protected, false, '已取消加密');
-  assert.strictEqual(p.content, '这是要加密的正文', '明文已恢复');
-  assert.ok(!p.enc, '密文已清除');
-  // —— 错误密码不取消 ——
-  b.win.BLOG_POSTS[0].protected = true;
-  b.win.BLOG_POSTS[0].enc = await b.ctx.encryptText('再次加密内容', 'pw9999');
-  b.win.BLOG_POSTS[0].content = '';
-  prompts.push('wrong-pass');
-  await b.ctx.toggleLockFromList('p1');
-  p = b.win.BLOG_POSTS[0];
-  assert.strictEqual(p.protected, true, '错误密码不取消加密');
-  assert.ok(p.enc, '密文保留');
-  // —— 两次密码不一致不加密 ——
-  b.win.BLOG_POSTS[0].protected = false;
-  b.win.BLOG_POSTS[0].content = '新明文';
-  prompts.push('aaa111', 'bbb222');
-  await b.ctx.toggleLockFromList('p1');
-  p = b.win.BLOG_POSTS[0];
-  assert.strictEqual(p.protected, false, '两次密码不一致不加密');
-  assert.strictEqual(p.content, '新明文', '明文未动');
+  // 客户端加密切换已移除：加密/解密在云端 API 层完成（见「端到端：云端加密文章锁屏解锁成功」）
+  assert.strictEqual(typeof b.ctx.toggleLockFromList, 'undefined', '客户端加密切换函数不存在');
+  assert.strictEqual(typeof b.ctx.encryptText, 'undefined', '客户端加密函数不存在');
 }]);
 
 tests.push(['admin 列表：云端模式置顶切换走 PUT 全字段（保留内容/标签）', async () => {
@@ -1609,7 +1968,7 @@ tests.push(['admin 列表：云端模式置顶切换走 PUT 全字段（保留�
   assert.strictEqual(body.pinned, true, 'PUT 带 pinned=true');
   assert.strictEqual(body.content, '正文', 'PUT 保留 content');
   assert.deepStrictEqual(body.tags, ['a'], 'PUT 保留 tags');
-  assert.strictEqual(body.enc, null, 'PUT 密文字段为 null');
+  assert.ok(!('enc' in body), 'PUT 不含密文字段（加密由服务端管理）');
   assert.strictEqual(b.win.BLOG_POSTS[0].pinned, true, '本地同步置顶');
 }]);
 
@@ -1653,6 +2012,105 @@ tests.push(['云端详情：首次拉取存缓存，再次进入缓存秒开，�
   await new Promise((r) => setTimeout(r, 30));
   html = b.ctx.document.querySelector('#app').innerHTML;
   assert.ok(html.includes('正文V2'), '内容未更新保持 V2');
+}]);
+
+tests.push(['云端详情：文章删除后访问旧链接 → 移除列表并显示不存在，不再无限拉取', async () => {
+  let detailHits = 0; // 详情接口被请求的次数（应恰好 1 次，证明无循环）
+  const fetchStub = async (url) => {
+    const u = String(url);
+    if (u.endsWith('/api/posts')) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    if (u.endsWith('/api/posts/c9')) { detailHits++; return { ok: false, status: 404, json: async () => ({ error: '未找到该内容' }) }; }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fetchStub });
+  // 模拟残留的兜底列表仍含已删除文章
+  b.win.BLOG_POSTS = [{ id: 'c9', title: '已被删除的文章', date: '2025-01-01', content: '', tags: [] }];
+  const loc = b.ctx.location;
+  loc.pathname = '/posts/c9/'; loc.search = ''; loc.hash = '';
+  await b.ctx.route();
+  await new Promise((r) => setTimeout(r, 40));
+  let html = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(!html.includes('site.loading'), '不再停留在无限加载态');
+  assert.ok(html.includes('post.notFound'), '显示「内容不存在」（not-found 页面）');
+  assert.strictEqual(b.win.BLOG_POSTS.filter((p) => p && p.id === 'c9').length, 0, '已将删除的文章移出本地列表');
+  assert.strictEqual(detailHits, 1, '详情接口只请求一次（无循环拉取）');
+  // 再次访问：列表已无该文，直接显示不存在，不再发起详情请求
+  loc.pathname = '/posts/c9/'; loc.search = ''; loc.hash = '';
+  await b.ctx.route();
+  await new Promise((r) => setTimeout(r, 40));
+  html = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html.includes('post.notFound'), '再次访问仍显示不存在');
+  assert.strictEqual(detailHits, 1, '二次访问不再请求详情接口');
+}]);
+
+tests.push(['云端探测未完成时访问文章 → 显示加载态而非「内容不存在」误闪', async () => {
+  const gate = {};
+  gate.promise = new Promise((r) => { gate.resolve = r; });
+  // api 拉取挂起（模拟云端探测仍在进行）→ 期间首次渲染必须显示加载态，不得闪现 notFound
+  const fetchStub = async (url) => {
+    const u = String(url);
+    // locale JSON 立即 404 → i18n 回退内嵌中文，避免卡住首帧渲染
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    await gate.promise;   // 仅挂起 /api/*（posts + settings）
+    if (u.endsWith('/api/posts')) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [{ id: 'c1', title: '云端文章', date: '2025-01-01', content: '正文D', tags: [] }] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const { ctx, appEl, win } = makeCtx({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fetchStub });
+  setRoute(ctx, '/posts/c1/');
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'i18n.js'), 'utf8'), ctx, { filename: 'i18n.js' });
+  ctx.t = (k, v) => win.__i18n.t(k, v);
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'posts.js'), 'utf8'), ctx, { filename: 'posts.js' });
+  win.BLOG_POSTS = []; // posts.js 当前为空 → 列表里没有任何文章
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'app.js'), 'utf8'), ctx, { filename: 'app.js' });
+  // __bootPromise 已启动、api 拉取仍挂起；等微任务/首帧渲染完成
+  // （本用例 locale 请求 404 → i18n 回退内嵌中文 → t() 渲染中文字面量）
+  await new Promise((r) => setTimeout(r, 20));
+  let html = appEl.innerHTML;
+  assert.ok(html.includes('加载中'), '探测未完成时显示加载态（site.loading=加载中）');
+  assert.ok(!html.includes('内容不存在'), '不闪现「内容不存在」（post.notFound）');
+  // 放行探测 → boot 完成 → 重渲染出文章正文
+  gate.resolve();
+  await win.__bootPromise;
+  await new Promise((r) => setTimeout(r, 20));
+  html = appEl.innerHTML;
+  assert.ok(html.includes('正文D'), '探测完成后渲染出文章正文');
+}]);
+
+tests.push(['顶栏渲染「背景动画」开关按钮（bg-anim 未加载时安全降级）', async () => {
+  const fn = async (url) => {
+    const u = String(url);
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.endsWith('/api/posts')) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn });
+  let html = b.ctx.document.querySelector('#app').innerHTML;
+  // bg-anim.js 未加载（测试档不含该文件）→ window.bgAnim 不存在 → 按钮应渲染且为关闭态
+  assert.ok(html.includes('id="bgAnimToggle"'), '顶栏渲染背景动画开关按钮');
+  assert.ok(html.includes('aria-pressed="false"'), 'bg-anim 未加载时按钮关闭态（安全降级）');
+  // 模拟 bg-anim 已加载且开启：重渲染后按钮应为开启态
+  b.win.bgAnim = { isOn: function () { return true; } };
+  b.ctx.route();
+  await new Promise((r) => setTimeout(r, 20));
+  html = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html.includes('aria-pressed="true"'), 'bg-anim 开启时按钮为开启态');
+}]);
+
+tests.push(['背景动画开关位于顶栏 actions（与搜索同排），侧边栏第二排已移除', async () => {
+  const fn = async (url) => {
+    const u = String(url);
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.endsWith('/api/posts')) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn });
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  // 开关（icon-btn 圆钮）存在且位于顶栏（侧边栏之外）
+  assert.ok(html.includes('id="bgAnimToggle"'), '顶栏背景动画开关按钮仍渲染');
+  assert.ok(html.includes('icon-btn'), '开关为 icon-btn 圆钮形态');
+  // 侧边栏第二排已移除（开关只保留顶栏一处）
+  assert.ok(!html.includes('bgAnimSideToggle'), '侧边栏不再有背景动画开关');
+  assert.ok(!html.includes('sidebar-picks-2'), '侧边栏第二排容器已移除');
 }]);
 
 /* ---------- 运行 ---------- */

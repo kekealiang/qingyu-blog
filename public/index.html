@@ -20,7 +20,10 @@
   <!-- Canonical -->
   <link rel="canonical" href="/">
   <!-- RSS -->
-  <link rel="alternate" type="application/rss+xml" title="Qingyu'Blog RSS" href="/api/feed.xml">
+  <link rel="alternate" type="application/rss+xml" title="Qingyu'Blog RSS" href="/feed.xml">
+  <!-- Agentic Resource Discovery（ARD v0.91）与旧版 AI Catalog 兼容入口 -->
+  <link rel="ard" href="/.well-known/ard.json">
+  <link rel="ai-catalog" href="/.well-known/ai-catalog.json">
   <!-- Schema.org JSON-LD（首页） -->
   <script type="application/ld+json">
   {
@@ -47,18 +50,31 @@
         var b = document.querySelector('base');
         if (b) b.setAttribute('href', './');
       }
+      // iOS 检测（含 iPadOS 13+ 的 MacIntel 伪装）：命中后打 .ios 类，
+      // style.css 据此用系统原生宋体/仿宋、跳过 CDN webfont（省流量）。
+      var _plat = navigator.platform || '';
+      var _ua = navigator.userAgent || '';
+      if (/iP(hone|ad|od)/.test(_plat) || (/MacIntel/.test(_plat) && navigator.maxTouchPoints > 1) || /iPad|iPhone|iPod/.test(_ua)) {
+        document.documentElement.classList.add('ios');
+      }
       try {
         var t = localStorage.getItem('qingyu.theme');
         if (t !== 'light' && t !== 'dark') {
           t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
         }
         document.documentElement.setAttribute('data-theme', t);
+        // 主题色（accent）：缺省 terra = 默认赭橙配色；提前设置避免切色后首屏闪动
+        var a = localStorage.getItem('qingyu.accent');
+        if (['terra', 'indigo', 'bamboo', 'dusk'].indexOf(a) >= 0) {
+          document.documentElement.setAttribute('data-accent', a);
+        }
       } catch (e) {}
     })();
   </script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024'><path d='M73.44768 958.112526S286.575881 57.38067 917.281057 2.410953c0 0-20.734192 341.390875-202.03782 479.297358 0 0-33.753335 45.808098 73.292956 31.824573 0 0-12.536953 153.336579-201.555629 192.8762 0 0-28.93143 28.93143 54.969717 31.824573 0 0-88.723052 137.424293-311.977254 63.649146 0 0 89.687433-216.985725 165.391341-289.3143a2209.396876 2209.396876 0 0 0-385.7524 431.078308s-15.430096 35.199907-36.164288 14.465715z' fill='%239B9A9A'/></svg>">
   <style>
     /* 首屏加载动画：在 app.js 接管前显示，主题色与暖色调一致 */
+    .mp-root { display: none; }
     .boot-load {
       position: fixed; inset: 0;
       display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -69,10 +85,10 @@
     }
     .boot-ring::before, .boot-ring::after {
       content: ""; position: absolute; inset: 0; border-radius: 50%;
-      border: 3px solid transparent; border-top-color: #c25e3a;
+      border: 3px solid transparent; border-top-color: var(--accent, #c25e3a);
       animation: bootSpin 1s cubic-bezier(.5,.15,.75,.45) infinite;
     }
-    .boot-ring::after { animation-delay: .15s; border-top-color: #e08a63; opacity: .7; }
+    .boot-ring::after { animation-delay: .15s; border-top-color: var(--accent-2, #e08a63); opacity: .7; }
     .boot-dot {
       width: 7px; height: 7px; border-radius: 50%; background: #cfc4b6;
       animation: bootPulse 1.2s ease-in-out infinite;
@@ -86,24 +102,12 @@
       .boot-name { color: #a89b8e; }
     }
   </style>
-  <link rel="stylesheet" href="style.css">
-  <!-- 后台样式按需加载：仅访问后台路由时由 app.js 动态注入 -->
-  <!-- 预连接字体 CDN，降低首字节延迟 -->
-  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-  <!-- 字体：外部 CDN 样式表改为非阻塞加载（media=print + onload 切换），避免拖慢首屏渲染；
-       本地分片字体（result.css）同域、体积小，保持常规加载 -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@free-fonts/genyo-mincho@1.0.1/genyo-mincho.css" media="print" onload="this.media='all'">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@free-fonts/zhuque-fangsong@1.0.0/zhuque-fangsong.css" media="print" onload="this.media='all'">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cn-fontsource-source-han-serif-sc-vf@1.0.9/font.css" media="print" onload="this.media='all'">
-  <noscript>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@free-fonts/genyo-mincho@1.0.1/genyo-mincho.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@free-fonts/zhuque-fangsong@1.0.0/zhuque-fangsong.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cn-fontsource-source-han-serif-sc-vf@1.0.9/font.css">
-  </noscript>
-  <link rel="stylesheet" href="fonts/dreamserif/result.css">
-  <script defer src="config.js"></script>
-  <script defer src="posts.js"></script>
-  <script defer src="i18n.js"></script>
+  <link id="global-style" rel="stylesheet" href="style.min.css?v=2.7.2" media="print" onload="this.media='all'">
+  <noscript><link rel="stylesheet" href="style.min.css?v=2.7.2"></noscript>
+  <!-- 字体策略：前台全部改走系统宋体/仿宋栈，不再加载任何 webfont，PageSpeed 网络负载大幅下降 -->
+  <script defer src="config.min.js?v=2.7.2"></script>
+  <script defer src="posts.min.js?v=2.7.2"></script>
+  <script defer src="i18n.min.js?v=2.7.2"></script>
 </head>
 <body>
   <div id="app">
@@ -113,7 +117,43 @@
       <div class="boot-name">Qingyu'Blog · 加载中</div>
     </div>
   </div>
-  <script defer src="app.js"></script>
+  <script defer src="app.min.js?v=2.7.2"></script>
+  <script>
+  // 非首屏脚本改为「空闲/按需」加载：先保证首页渲染与核心交互，
+  // 再在浏览器空闲时拉取播放器与背景动画；触屏设备默认不预载背景动画。
+  (function () {
+    function loadJs(src) {
+      var s = document.createElement('script');
+      s.src = src + '?v=2.7.2';
+      s.defer = true;
+      document.body.appendChild(s);
+      return s;
+    }
+    function loadCss(href) {
+      var l = document.createElement('link');
+      l.rel = 'stylesheet';
+      l.href = href + '?v=2.7.2';
+      document.head.appendChild(l);
+      return l;
+    }
+    function idle(fn) {
+      try {
+        if ('requestIdleCallback' in window) { requestIdleCallback(fn, { timeout: 2500 }); return; }
+      } catch (e) {}
+      setTimeout(fn, 1600);
+    }
+    var isTouch = false;
+    try { isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints || 0) > 0; } catch (e) {}
+    if (!isTouch) {
+      idle(function () { loadJs('bg-anim.min.js'); });
+    }
+    var p = '';
+    try { p = location.pathname || ''; } catch (e) {}
+    if (p.indexOf('/admin') !== 0 && p !== '/write' && !/^\/posts\/[^/]+\/(edit)$/.test(p)) {
+      idle(function () { loadCss('music-player.min.css'); loadJs('music-player.min.js'); });
+    }
+  })();
+  </script>
   <!-- 后台脚本按需加载：仅进入后台路由时由 app.js 懒加载 -->
 </body>
 </html>

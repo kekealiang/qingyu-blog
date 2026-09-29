@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 14">
+  <rect y="0" width="20" height="4.67" fill="#FF9933"/>
+  <rect y="4.67" width="20" height="4.67" fill="#FFFFFF"/>
+  <rect y="9.33" width="20" height="4.67" fill="#138808"/>
+  <circle cx="10.0" cy="7.0" r="1.8" fill="none" stroke="#000080" stroke-width="0.32"/>
+  <g stroke="#000080" stroke-width="0.22" stroke-linecap="round">
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(0.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(15.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(30.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(45.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(60.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(75.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(90.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(105.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(120.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(135.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(150.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(165.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(180.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(195.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(210.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(225.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(240.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(255.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(270.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(285.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(300.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(315.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(330.0 10.0 7.0)"/>
+<line x1="10.0" y1="7.0" x2="10.0" y2="5.25" transform="rotate(345.0 10.0 7.0)"/>
+  </g>
+  <circle cx="10.0" cy="7.0" r="0.62" fill="#000080"/>
+</svg>

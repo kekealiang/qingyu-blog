@@ -6,14 +6,129 @@
  * ============================================================================ */
 'use strict';
 
-var BLOG_VERSION = '2.4.2';
+var BLOG_VERSION = '2.7.2';
 
 /* ---------- 全局缓存 ---------- */
 var _searchOpen = false;   // 顶部导航搜索是否展开
 var _searchDocBound = false;   // document 级外部点击监听是否已绑定
 var _commentsCache = {};
 var _statsCache = {};
-var _routeTimer = null;
+
+/* ---------- Smoji 表情库 ---------- */
+var _smojiPicker = null;
+var _smojiTrigger = null;
+var _smojiCssLoaded = false;
+var _smojiLibReady = null;
+
+function destroySmojiPicker() {
+  if (_smojiPicker && typeof _smojiPicker.destroy === 'function') { try { _smojiPicker.destroy(); } catch (e) {} }
+  _smojiPicker = null;
+  _smojiTrigger = null;
+}
+
+function _loadSmojiCss() {
+  if (_smojiCssLoaded) return Promise.resolve();
+  return new Promise(function (resolve) {
+    var link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = appRoot() + 'libs/smoji/style.css';
+    link.onload = function () { _smojiCssLoaded = true; resolve(); };
+    link.onerror = function () { _smojiCssLoaded = true; resolve(); };
+    document.head.appendChild(link);
+  });
+}
+
+function _loadSmojiScript(src) {
+  return new Promise(function (resolve, reject) {
+    var script = document.createElement('script');
+    script.src = src;
+    script.onload = function () { resolve(); };
+    script.onerror = function () { reject(new Error('Smoji load failed: ' + src)); };
+    document.head.appendChild(script);
+  });
+}
+
+function _loadSmojiLib() {
+  if (_smojiLibReady) return _smojiLibReady;
+  var libP = window.SmojiLib ? Promise.resolve() : _loadSmojiScript(appRoot() + 'libs/smoji/smoji.global.js');
+  var dataP = window.SmojiManifestData ? Promise.resolve() : _loadSmojiScript(appRoot() + 'libs/smoji/smoji.data.js');
+  _smojiLibReady = Promise.all([libP, dataP]).then(function () {
+    if (!window.SmojiLib) throw new Error('Smoji not loaded');
+  }, function (e) { _smojiLibReady = null; throw e; });
+  return _smojiLibReady;
+}
+
+function _ensureCryptoRandomUUID() {
+  try {
+    if (typeof crypto !== 'undefined' && !crypto.randomUUID) {
+      crypto.randomUUID = function () {
+        return 'smoji-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+      };
+    }
+  } catch (e) {}
+}
+
+function ensureSmojiPicker(trigger, textarea) {
+  if (_smojiPicker && _smojiTrigger === trigger) return Promise.resolve();
+  if (_smojiPicker) destroySmojiPicker();
+  return _loadSmojiCss()
+    .then(function () { return _loadSmojiLib(); })
+    .then(function () {
+      if (!window.SmojiLib) throw new Error('Smoji not loaded');
+      var smoj = window.SmojiLib.ui;
+      var man = window.SmojiLib.manifest;
+      var mark = window.SmojiLib.marker;
+      function getManifest() {
+        var localP = null;
+        if (window.SmojiManifestData) {
+          // 本地内置更丰富表情清单：file:// 直开也能弹出选择器。
+          try { localP = Promise.resolve(man.parseSmojiManifest(window.SmojiManifestData, 'https://s3-cdn.zsh.moe/smoji/smoji.json')); } catch (e) {}
+        }
+        // 在线官方表情清单：能联网时优先展示并合并到选择器里。
+        var remoteP = man.loadSmojiManifest('https://s3-cdn.zsh.moe/smoji/smoji.json').catch(function () { return null; });
+        return Promise.all([Promise.resolve(localP), remoteP]).then(function (res) {
+          var packs = [];
+          var seen = {};
+          function addPacks(m) {
+            if (!m || !Array.isArray(m.packs)) return;
+            m.packs.forEach(function (p) {
+              if (!seen[p.id]) { seen[p.id] = 1; packs.push(p); }
+            });
+          }
+          // 在线官方表情显示在前面，本地清单补齐后面，避免重复。
+          addPacks(res[1]);
+          addPacks(res[0]);
+          return packs.length ? { version: 1, packs: packs } : null;
+        });
+      }
+      return getManifest().then(function (manifest) {
+        if (!manifest || !manifest.packs || !manifest.packs.length) return;
+        _ensureCryptoRandomUUID();
+        _smojiPicker = smoj.createSmoji({
+          trigger: trigger,
+          target: smoj.textTarget(textarea, { serialize: mark.smojiMarker }),
+          packs: manifest.packs,
+          closeOnSelect: true
+        });
+        _smojiTrigger = trigger;
+      });
+    });
+}
+
+function initSmojiPicker(trigger, textarea) {
+  if (!trigger || !textarea || trigger.__smojiBound) return;
+  trigger.__smojiBound = true;
+  function onClick(e) {
+    e.preventDefault();
+    if (trigger.__smojiLoading) return;
+    trigger.__smojiLoading = true;
+    ensureSmojiPicker(trigger, textarea).then(function () {
+      if (_smojiPicker && _smojiTrigger === trigger) _smojiPicker.open();
+      trigger.removeEventListener('click', onClick);
+    }).catch(function () { trigger.__smojiLoading = false; });
+  }
+  trigger.addEventListener('click', onClick);
+}
 
 /* ---------- 基础工具 ---------- */
 /* ---------- main theme (dark / light) ---------- */
@@ -28,7 +143,7 @@ function applyTheme(t) {
   try { document.documentElement.setAttribute('data-theme', t); } catch (e) {}
 }
 function setTheme(t) { applyTheme(t); try { localStorage.setItem(themeKey(), t); } catch (e) {} }
-function toggleTheme() { var n = getTheme() === 'dark' ? 'light' : 'dark'; setTheme(n); refreshThemeIcon(); return n; }
+function toggleTheme() { var n = getTheme() === 'dark' ? 'light' : 'dark'; setTheme(n); refreshThemeIcon(); renderAccentSwatches(); renderAccentNativeSelect(); return n; }
 /* 统一 SVG 图标：currentColor 描边，自动继承文字色、hover 变主题色 */
 function svgIcon(name, size) {
   size = size || 18;
@@ -62,13 +177,178 @@ function svgIcon(name, size) {
     tag: '<svg ' + s + ' ' + c + '><path d="M3 3h7l11 11-7 7L3 10V3z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg>',
     list: '<svg ' + s + ' ' + c + '><path d="M9 6h12M9 12h12M9 18h12"/><circle cx="4.5" cy="6" r="1"/><circle cx="4.5" cy="12" r="1"/><circle cx="4.5" cy="18" r="1"/></svg>',
     check: '<svg ' + s + ' ' + c + '><path d="M4 12.5l5 5L20 6.5"/></svg>',
-    send: '<svg ' + s + ' ' + c + '><path d="M3 11l18-8-8 18-2-8-8-2z"/><path d="M21 3 11 13"/></svg>'
+    send: '<svg ' + s + ' ' + c + '><path d="M3 11l18-8-8 18-2-8-8-2z"/><path d="M21 3 11 13"/></svg>',
+    palette: '<svg ' + s + ' ' + c + '><path d="M12 3a9 9 0 1 0 5.4 16.2A2.4 2.4 0 0 0 15.6 17h-.9a2.6 2.6 0 0 1-2.6-2.6c0-1.4 1.1-2.6 2.6-2.6h1.4A3.9 3.9 0 0 0 20.2 8 9 9 0 0 0 12 3z"/><circle cx="7.4" cy="11.3" r="1"/><circle cx="10.6" cy="7.2" r="1"/><circle cx="15.4" cy="8.6" r="1"/></svg>',
+    globe: '<svg ' + s + ' ' + c + '><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15.5 15.5 0 0 1 0 18M12 3a15.5 15.5 0 0 0 0 18"/></svg>',
+    spark: '<svg ' + s + ' ' + c + '><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg>',
+    copy: '<svg ' + s + ' ' + c + '><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
+    music: '<svg ' + s + ' ' + c + '><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+    play: '<svg ' + s + ' ' + c + '><path d="M7 4.5v15l13-7.5z"/></svg>',
+    pause: '<svg ' + s + ' ' + c + '><path d="M7 4.5h3.4v15H7zM13.6 4.5H17v15h-3.4z"/></svg>',
+    prev: '<svg ' + s + ' ' + c + '><path d="M6 5v14M19 5l-9 7 9 7z"/></svg>',
+    next: '<svg ' + s + ' ' + c + '><path d="M18 5v14M5 5l9 7-9 7z"/></svg>',
+    volume: '<svg ' + s + ' ' + c + '><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11"/></svg>',
+    gauge: '<svg ' + s + ' ' + c + '><path d="M4.5 17.5A8.5 8.5 0 1 1 19.5 17.5"/><path d="M12 14.2 16.8 9.4M3 17.5h18"/></svg>',
+    sliders: '<svg ' + s + ' ' + c + '><path d="M4 7h9M17 7h3M4 17h3M11 17h9M13 4.5v5M7 14.5v5"/></svg>',
+    clock: '<svg ' + s + ' ' + c + '><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2.2"/></svg>',
+    refresh: '<svg ' + s + ' ' + c + '><path d="M20 12a8 8 0 1 1-2.5-5.8"/><path d="M20 4v4.5h-4.5"/></svg>'
   };
   return I[name] || '';
 }
 function themeIcon() { return getTheme() === 'dark' ? svgIcon('sun', 18) : svgIcon('moon', 18); }
 function refreshThemeIcon() {
   var b = document.querySelector('#themeToggle'); if (b) b.innerHTML = themeIcon();
+}
+
+/* ---------- 主题色（accent palette）切换 ----------
+ * 与明暗主题正交的第二个维度：localStorage qingyu.accent（缺省 terra = 现有赭橙配色）。
+ * 色板定义在 style.css 的 [data-accent=...] 变量块；此处只负责
+ * data-accent 属性、持久化、以及取色面板（顶栏弹层 + 移动端侧栏）的渲染与交互。 */
+var ACCENT_PALETTES = [
+  { id: 'terra',  zh: '赭橙',   en: 'Terra',   light: '#c25e3a', dark: '#e08a63' },
+  { id: 'indigo', zh: '黛蓝',   en: 'Indigo',  light: '#2b73af', dark: '#619ac3' },
+  { id: 'bamboo', zh: '竹青',   en: 'Bamboo',  light: '#497568', dark: '#1ba784' },
+  { id: 'dusk',   zh: '凝夜紫', en: 'Dusk',    light: '#8b2671', dark: '#ad6598' }
+];
+function accentKey() { return 'qingyu.accent'; }
+/* 面板标题内置多语言：不依赖 locales JSON（避免旧 JSON 缓存导致显示成 key 原文） */
+var ACCENT_TITLES = {
+  'zh-CN': '主题色',
+  'en': 'Theme color',
+  'ja': 'テーマカラー',
+  'ko': '테마 색상',
+  'hi': 'थीम रंग'
+};
+function accentTitle() {
+  var loc = (window.__i18n && window.__i18n.getLocale) ? window.__i18n.getLocale() : 'zh-CN';
+  return ACCENT_TITLES[loc] || ACCENT_TITLES['zh-CN'];
+}
+function getAccent() {
+  try {
+    var v = localStorage.getItem(accentKey());
+    for (var i = 0; i < ACCENT_PALETTES.length; i++) if (ACCENT_PALETTES[i].id === v) return v;
+  } catch (e) {}
+  return 'terra';
+}
+function applyAccent(a) {
+  try { document.documentElement.setAttribute('data-accent', a); } catch (e) {}
+}
+function setAccent(a) {
+  applyAccent(a);
+  try { localStorage.setItem(accentKey(), a); } catch (e) {}
+  renderAccentSwatches();
+  renderAccentNativeSelect();
+}
+function accentSwatchColor(id) {
+  for (var i = 0; i < ACCENT_PALETTES.length; i++) {
+    if (ACCENT_PALETTES[i].id === id) return getTheme() === 'dark' ? ACCENT_PALETTES[i].dark : ACCENT_PALETTES[i].light;
+  }
+  return '#999';
+}
+/* 桌面弹出面板：2×2 色块（手机端走原生下拉） */
+function accentSwatchesHTML() {
+  var cur = getAccent();
+  var lang = (window.__i18n && window.__i18n.getLocale) ? window.__i18n.getLocale() : '';
+  return ACCENT_PALETTES.map(function (p) {
+    var active = p.id === cur;
+    var label = (lang && lang.indexOf('en') === 0) ? p.en : p.zh;
+    return '<button type="button" class="accent-swatch' + (active ? ' active' : '') + '" data-accent="' + p.id + '"'
+      + ' title="' + esc(p.en + ' · ' + p.zh) + '" aria-label="' + esc(p.zh) + '" aria-pressed="' + active + '">'
+      + '<span class="accent-dot" style="background:' + accentSwatchColor(p.id) + '"></span>'
+      + '<span class="accent-name">' + esc(label) + '</span></button>';
+  }).join('');
+}
+function renderAccentSwatches() {
+  var boxes = document.querySelectorAll('.accent-pop-swatches');
+  for (var i = 0; i < boxes.length; i++) boxes[i].innerHTML = accentSwatchesHTML();
+}
+function toggleAccentPop() {
+  var pop = document.getElementById('accentPop');
+  if (!pop) return;
+  var open = pop.classList.toggle('open');
+  var btn = document.getElementById('accentToggle');
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+function closeAccentPop() {
+  var pop = document.getElementById('accentPop');
+  if (pop) pop.classList.remove('open');
+  var btn = document.getElementById('accentToggle');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+/* 手机侧栏：与语言选择完全一致的原生下拉（样式 .lang-switch 复用，效果 = 系统原生弹出） */
+function accentLabelOf(id) {
+  for (var i = 0; i < ACCENT_PALETTES.length; i++) {
+    if (ACCENT_PALETTES[i].id === id) {
+      var lang = (window.__i18n && window.__i18n.getLocale) ? window.__i18n.getLocale() : '';
+      return (lang && lang.indexOf('en') === 0) ? ACCENT_PALETTES[i].en : ACCENT_PALETTES[i].zh;
+    }
+  }
+  return '';
+}
+function renderAccentNativeSelect() {
+  var sel = document.getElementById('accentNativeSide');
+  if (!sel) return;
+  var cur = getAccent();
+  var dot = document.getElementById('accentNativeDot');
+  if (dot) dot.style.background = accentSwatchColor(cur);
+  var opts = ACCENT_PALETTES.map(function (p) {
+    return '<option value="' + p.id + '"' + (p.id === cur ? ' selected' : '') + '>' + esc(accentLabelOf(p.id)) + '</option>';
+  }).join('');
+  if (sel.innerHTML !== opts) sel.innerHTML = opts;
+  if (sel.value !== cur) sel.value = cur;
+  if (!sel.dataset.bound) {
+    sel.dataset.bound = '1';
+    sel.addEventListener('change', function () { setAccent(this.value); });
+  }
+}
+/* 桌面语言：🌐 图标按钮 + 弹出面板（与主题色弹层同风格） */
+var LANG_TITLES = {
+  'zh-CN': '语言', 'en': 'Language', 'ja': '言語', 'ko': '언어', 'hi': 'भाषा'
+};
+function langTitle() {
+  var loc = (window.__i18n && window.__i18n.getLocale) ? window.__i18n.getLocale() : 'zh-CN';
+  return LANG_TITLES[loc] || '语言';
+}
+function langOptionsHTML() {
+  var langs = (window.__i18n && window.__i18n.getLanguages) ? window.__i18n.getLanguages() : [];
+  var cur = (window.__i18n && window.__i18n.getLocale) ? window.__i18n.getLocale() : 'zh-CN';
+  return langs.map(function (l, i) {
+    var active = l.code === cur;
+    return '<button type="button" class="lang-option' + (active ? ' active' : '') + '" data-lang="' + l.code + '" role="option" aria-selected="' + active + '" aria-posinset="' + (i + 1) + '" aria-setsize="' + langs.length + '">'
+      + '<span class="lang-flag">' + flagImg(l.code) + '</span><span class="lang-name">' + esc(l.name) + '</span></button>';
+  }).join('');
+}
+/* 桌面语言面板的旗帜：使用本地 SVG，避免 Windows 上旗帜 emoji 渲染为字母（手机端原生 select 按平台显示表情或字母标识）。
+   本地 file:// 直开时用相对路径，其余场景用站点根路径。 */
+function flagImg(code) {
+  var c = { 'zh-CN': 'cn', 'en': 'gb', 'ja': 'jp', 'ko': 'kr', 'hi': 'in' }[code] || 'cn';
+  var src = useHashMode() ? 'flags/' + c + '.svg' : appRoot() + '/flags/' + c + '.svg';
+  return '<img class="lang-flag-img" src="' + src + '" alt="' + c.toUpperCase() + '" width="20" height="14" loading="lazy">';
+}
+/* Windows 下原生 select 无法渲染旗帜 emoji（会退化成字母），改用具象的字母标识；
+   其他平台（手机/非 Windows 桌面）仍保留真实旗帜 emoji。 */
+function compactLangFlag(l) {
+  if (!l || typeof navigator === 'undefined') return l && l.flag ? l.flag : '';
+  if (!/win/i.test(String(navigator.platform || navigator.userAgent || ''))) return l.flag || '';
+  return ({ 'zh-CN': 'CN', 'en': 'EN', 'ja': 'JA', 'ko': 'KO', 'hi': 'HI' })[l.code] || '';
+}
+function renderLangPop() {
+  var inner = document.getElementById('langPopInner');
+  if (inner) inner.innerHTML = langOptionsHTML();
+}
+function toggleLangPop() {
+  var pop = document.getElementById('langPop');
+  if (!pop) return;
+  var open = pop.classList.toggle('open');
+  var btn = document.getElementById('langToggle');
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) renderLangPop();
+}
+function closeLangPop() {
+  var pop = document.getElementById('langPop');
+  if (pop && pop.classList.contains('open')) pop.classList.remove('open');
+  var btn = document.getElementById('langToggle');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
 }
 
 function esc(s) {
@@ -285,6 +565,12 @@ function renderMarkdown(md) {
   return html;
 }
 
+function escSmoji(safeHtml) {
+  return String(safeHtml == null ? '' : safeHtml).replace(/!\[smoji:([^\]]{1,40})\]\((https?:\/\/s3-cdn\.zsh\.moe\/smoji\/[^()\s]+)\)/g, function (m, label, src) {
+    return '<img class="smoji-inline" src="' + src + '" alt="[表情：' + label + ']" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
+  });
+}
+
 function inlineMd(s) {
   var t = esc(String(s || ""));
   t = t.replace(/\\\\([*_`~\\[\\]])/g, '\u0001$1');
@@ -296,10 +582,14 @@ function inlineMd(s) {
   t = t.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   // 删除线
   t = t.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+  // Smoji 表情（先于普通图片；仅匹配 smoji: 标记 + Smoji 官方 CDN 的 http(s) 图片 URL 后才渲染）
+  t = t.replace(/!\[smoji:([^\]]{1,40})\]\((https?:\/\/s3-cdn\.zsh\.moe\/smoji\/[^()\s]+)\)/g, function (m, label, src) {
+    return '<img class="smoji-inline" src="' + src + '" alt="[表情：' + label + ']" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
+  });
   // 图片（过滤 javascript:/data: 等危险协议）
   t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (m, alt, src) {
     if (/^\s*(javascript|data|vbscript):/i.test(String(src).trim())) return m;
-    return '<img src="' + src + '" alt="' + alt + '">';
+    return '<img src="' + src + '" alt="' + alt + '" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
   });
   // 链接（过滤 javascript:/data: 等危险协议）
   t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (m, txt, url) {
@@ -356,11 +646,17 @@ function stampHeadingNumbers(headings) {
 /* ---------- 配置与数据 ---------- */
 // 云端模式下从 D1 加载的运行时站点设置（由 bootstrap 拉取并合并进 getConfig）
 var _siteSettings = null;
-function getSiteSettings() { return _siteSettings; }
 function parseJsonSafe(v) {
   if (v == null) return {};
   if (typeof v === 'object') return v;
   try { return JSON.parse(v); } catch (e) { return {}; }
+}
+function parseArrSafe(v) {
+  if (Array.isArray(v) && v.length) return v;
+  if (typeof v === 'string' && v.trim()) {
+    try { var a = JSON.parse(v); if (Array.isArray(a) && a.length) return a; } catch (e) {}
+  }
+  return [];
 }
 
 function getConfig() {
@@ -379,7 +675,9 @@ function getConfig() {
     writeToken: cfg.writeToken || '',
     adminPwd: cfg.adminPwd || '',
     pageSize: (typeof cfg.pageSize === 'number' && cfg.pageSize >= 0) ? cfg.pageSize : 8,
-    nav: [],
+    nav: parseArrSafe(s && s.nav_menu),
+    footerNav: parseArrSafe(s && s.footer_nav),
+    friendLinks: parseArrSafe(s && s.friend_links),
     footer: footer,
     site: siteInfo,        // 站点信息（头像/名称/简介）供关于页等使用
     profile: prof,         // 个人信息（头像/昵称/简介/邮箱）供关于页等使用
@@ -406,6 +704,11 @@ function getSiteAuthor() {
 
 function getStaticPosts() {
   return (typeof window !== 'undefined' && Array.isArray(window.BLOG_POSTS)) ? window.BLOG_POSTS : [];
+}
+
+/** 仅返回已发布文章（过滤草稿），用于前台公开页面（首页/归档/标签/关于/搜索等） */
+function getPublishedPosts() {
+  return getStaticPosts().filter(function (p) { return (p.status || 'published') !== 'draft'; });
 }
 
 function slug(s) { return String(s || '').toLowerCase().replace(/[^\w\u4e00-\u9fa5-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64); }
@@ -458,9 +761,28 @@ async function apiFetch(url, opts) {
       var j = await res.json();
       if (j && j.error) msg = String(j.error);
     } catch (e) { /* 非 JSON 响应体，保留状态码提示 */ }
-    throw new Error(msg);
+    var e401 = new Error(msg);
+    e401.status = res.status;
+    // 全局会话失效处理：401 且非登录/首次设密端点 → 自动退出登录状态。
+    // 抛给调用方的同时派发事件，让当前 SPA（后台/前台编辑器）主动跳转或提示。
+    if (res.status === 401 && !/api\/admin\/(login|setup)/.test(String(url))) {
+      handleSessionExpired(e401);
+    }
+    throw e401;
   }
   return res.json();
+}
+
+/* 会话失效（401）：清除本地会话并广播，由各界面自行跳转/提示。
+ * 仅当本地确实持有会话时才处理，避免「未登录访问公开接口被 401」误触发。 */
+function handleSessionExpired(err) {
+  var had = !!_sessionToken();
+  _setSessionToken('');
+  _setAdminSession(false);
+  if (!had) return;
+  try {
+    window.dispatchEvent(new CustomEvent('qy:session-expired', { detail: (err && err.status) || 401 }));
+  } catch (e) { /* 无 CustomEvent 环境忽略 */ }
 }
 
 function sortPagePosts(posts) {
@@ -471,7 +793,7 @@ function sortPagePosts(posts) {
 function globalSearch(query, limit) {
   var q = String(query || '').trim().toLowerCase();
   if (!q) return [];
-  var posts = sortPagePosts(getStaticPosts());
+  var posts = sortPagePosts(getPublishedPosts());
   var hits = [];
   posts.forEach(function (p) {
     var hay = ((p.search || '') + ' ' + (p.title || '') + ' ' + (p.excerpt || '') + ' ' + (p.content || '') + ' ' + (p.tags || []).join(' ')).toLowerCase();
@@ -802,6 +1124,7 @@ function _cloudOn() {
 }
 
 var _cloudDetected = false;   // boot 时置位：/api/posts 拉取成功 = 云端在线
+var _cloudReady = false;      // 云端探测是否已完成（成功或失败都置位，避免首页永远显示加载动画）
 
 function needAdminSetup() {
   return !_cfgPwd() && !_localPwd();
@@ -837,16 +1160,27 @@ async function tryAdmin(pwd) {
   if (hashed === target) { _setAdminSession(true); return true; }
   return false;
 }
-/** 云端登录：POST /api/admin/login，成功存 token；返回 { ok, message, mustChange, defaultPassword } */
-async function cloudLogin(pwd) {
+/** 云端登录：POST /api/admin/login，成功存 token；返回 { ok, message, status, mustChange, defaultPassword }。
+ *  setupKey（可选）：应急通道——服务端收到正确安装密钥（BLOG_ADMIN_SETUP_KEY）即跳过登录限流，
+ *  但**不会跳过密码校验**。用于「被爆破波及、冷却中也要立刻进后台」的场景。 */
+async function cloudLogin(pwd, setupKey) {
   try {
-    var data = await apiFetch('api/admin/login', { method: 'POST', body: JSON.stringify({ password: String(pwd || '') }) });
-    if (!data || !data.token) return { ok: false, message: (data && data.error) || t('admin.loginFail') };
+    var data = await apiFetch('api/admin/login', {
+      method: 'POST',
+      headers: setupKey ? { 'X-Setup-Key': String(setupKey) } : undefined,
+      body: JSON.stringify({ password: String(pwd || '') })
+    });
+    if (!data || !data.token) return { ok: false, status: 0, message: (data && data.error) || t('admin.loginFail') };
     _setSessionToken(data.token);
     _setAdminSession(true);
     return { ok: true, mustChange: !!data.mustChange, defaultPassword: data.defaultPassword || '' };
   } catch (e) {
-    return { ok: false, message: t('admin.loginFail') + '（HTTP ' + (e && e.message ? e.message.replace('HTTP ', '') : '') + '）' };
+    var status = (e && e.status) || 0;
+    var msg = String((e && e.message) || '');
+    // apiFetch 会优先透传后端 error 文案（如「尝试次数过多，请 10 秒后再试」），
+    // 此时不要再包一层「登录失败（HTTP …）」；只有拿不到文案时才回退到状态码提示。
+    if (msg && msg.indexOf('HTTP ') !== 0) return { ok: false, status: status, message: msg };
+    return { ok: false, status: status, message: t('admin.loginFail') + '（' + (msg || '') + '）' };
   }
 }
 /** 云端登出：调用 /api/admin/logout 并清除本地 token */
@@ -856,6 +1190,22 @@ async function cloudLogout() {
   _setAdminSession(false);
   if (_cloudOn() && t) {
     try { await apiFetch('api/admin/logout', { method: 'POST', body: '{}' }); } catch (e) {}
+  }
+}
+/** 云端初始化：使用安装密钥设置管理员密码（POST /api/admin/setup，携带 X-Setup-Key），
+ * 成功后自动登录拿 token。后端 BLOG_ADMIN_SETUP_KEY 未配置时返回 409 并透传提示。 */
+async function cloudSetupAdmin(pwd, setupKey) {
+  try {
+    var data = await apiFetch('api/admin/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Setup-Key': String(setupKey || '') },
+      body: JSON.stringify({ password: String(pwd || '') })
+    });
+    if (!data || !data.ok) return { ok: false, message: (data && data.error) || t('admin.loginFail') };
+    // 设置成功 → 自动登录（带上安装密钥，避免此时恰好被登录限流挡住）
+    return await cloudLogin(pwd, setupKey);
+  } catch (e) {
+    return { ok: false, message: t('admin.loginFail') + '（HTTP ' + (e && e.message ? e.message.replace('HTTP ', '') : '') + '）' };
   }
 }
 function adminLogout() {
@@ -933,14 +1283,13 @@ function ensureAdminBundle() {
   if (!_adminBundlePromise) {
     _adminBundlePromise = new Promise(function (resolve) {
       function done() { resolve(!!(window.QingyuAdmin && window.QingyuAdmin.mount)); }
-      window.__qingyuAdminManual = true;
       if (!document.querySelector('link[data-admin-css]')) {
         var l = document.createElement('link');
-        l.rel = 'stylesheet'; l.href = 'admin.css'; l.setAttribute('data-admin-css', '1');
+        l.rel = 'stylesheet'; l.href = 'admin.min.css?v=' + BLOG_VERSION; l.setAttribute('data-admin-css', '1');
         document.head.appendChild(l);
       }
       var s = document.createElement('script');
-      s.src = 'admin.js';
+      s.src = 'admin.min.js?v=' + BLOG_VERSION;
       s.onload = done;
       s.onerror = done;
       document.head.appendChild(s);
@@ -973,17 +1322,6 @@ function buildPostsJs() {
   return out;
 }
 
-/** 读取草稿：key='__new' 返回最近一次「保存/发布文章」的条目（总是 push 到最后），
- *  其余返回指定 id 的条目；找不到返回 null */
-function loadDraftFromStore(key) {
-  try {
-    var arr = JSON.parse(localStorage.getItem('qingyu.drafts') || '[]');
-    if (!Array.isArray(arr)) return null;
-    if (key === '__new') return arr.length ? arr[arr.length - 1] : null;
-    return arr.find(function (d) { return d && d.id === key; }) || null;
-  } catch (e) { return null; }
-}
-
 function saveDraftToStore(key, val) {
   try {
     var keyS = String(key || '');
@@ -1005,7 +1343,9 @@ function buildFeedXmlClient(posts, maxItems) {
   var cfg = getConfig();
   var base = cfg.siteUrl || (typeof location !== 'undefined' ? location.origin : '');
   base = String(base || '').replace(/\/+$/, '');
-  var list = (posts || []).slice().sort(sortPosts).slice(0, maxItems || 20);
+  // 与云端 buildFeedXml 对齐：排除加密文章与草稿（公开产物不外泄）
+  var list = (posts || []).filter(function (p) { return !(p && p.protected) && (p.status || 'published') !== 'draft'; })
+    .slice().sort(sortPosts).slice(0, maxItems || 20);
   var items = list.map(function (p) {
     var link = base + postUrl(p.id);
     // description 输出渲染后的 HTML（而非 Markdown 源码），阅读器直接显示富文本
@@ -1064,19 +1404,71 @@ function app() { return document.querySelector('#app'); }
     { i18n: 'nav.about',    url: '/about',     path: '/about' }
   ];
 
+  // 前台导航项：优先使用后台「博客设置 → 顶部导航」保存的配置，
+  // 未配置时回退到内置 NAV 默认值，保证样式与原有行为一致。
+  function navItems() {
+    var c = getConfig();
+    if (Array.isArray(c.nav) && c.nav.length) return c.nav;
+    return NAV;
+  }
+
+  // 旧后台保存数据里的默认中文文案：路径命中内置项时，仅当文本为空或等于当初的
+  // 默认中文才自动翻译；自定义导航文字（如“主页”）保持用户原样。
+  var NAV_DEFAULT_ZH = {
+    '/': '首页',
+    '/tags': '标签',
+    '/archive': '归档',
+    '/guestbook': '留言板',
+    '/about': '关于'
+  };
+  // 旧版后台可能保存过「留言」作为留言板入口文案，同样视为内置默认文案。
+  var NAV_DEFAULT_ZH_ALIAS = {
+    '/guestbook': ['留言']
+  };
+  function isDefaultZhText(norm, text) {
+    if (!text) return true;
+    if (NAV_DEFAULT_ZH[norm] === text) return true;
+    var al = NAV_DEFAULT_ZH_ALIAS[norm];
+    return al ? al.indexOf(text) >= 0 : false;
+  }
+  // 渲染导航前先合并一次默认导航，用于识别“首页/标签/归档/留言/关于”等内置路径。
+  var _navDefMap = null;
+  function defaultNavMap() {
+    if (_navDefMap) return _navDefMap;
+    var map = {};
+    NAV.forEach(function (it) {
+      var key = it.path || String(it.url || '').replace(/^#?\//, '/');
+      map[key] = it.i18n;
+      if (it.children) it.children.forEach(function (c) {
+        map[String(c.url || '').replace(/^#?\//, '/')] = c.i18n || '';
+      });
+    });
+    _navDefMap = map;
+    return map;
+  }
   // 将 NAV 配置解析为带翻译文本的导航项（含可选子菜单）。
+  // 兼容旧的后台保存数据：旧导航没有 i18n key 而只有“首页/标签…”等文字，
+  // 这里会按路径识别内置项并自动套用当前语言，外部自定义链接仍保留原文。
   function resolveNav(items) {
+    var defMap = defaultNavMap();
     return items.map(function (it) {
-      var n = { text: t(it.i18n), url: it.url, path: it.path };
+      var norm = String(it.url || '/').replace(/^#?\//, '/');
+      var i18n = it.i18n || (isDefaultZhText(norm, it.text) ? (defMap[norm] || '') : '');
+      var text = (i18n ? t(i18n) : '') || it.text || '';
+      var n = { text: text, url: it.url, path: it.path };
       if (it.children && it.children.length) {
-        n.children = it.children.map(function (c) { return { text: t(c.i18n), url: c.url }; });
+        n.children = it.children.map(function (c) {
+          var cNorm = String(c.url || '/').replace(/^#?\//, '/');
+          var cI18n = c.i18n || (isDefaultZhText(cNorm, c.text) ? (defMap[cNorm] || '') : '');
+          return { text: (cI18n ? t(cI18n) : '') || c.text || '', url: c.url };
+        });
       }
       return n;
     });
   }
 
   function renderNav(active) {
-  var navs = resolveNav(NAV);
+  var navs = resolveNav(navItems());
   var links = navs.map(function (n) {
     var raw = n.url || '/';
     var pathKey = n.path || (/^#\//.test(raw) ? raw.slice(1) : (/^\//.test(raw) ? raw : null));
@@ -1096,9 +1488,23 @@ function app() { return document.querySelector('#app'); }
     return '<div class="nav-item"><a href="' + esc(url) + '" class="' + cls + '"' + ext + '>' + esc(n.text || '') + '</a></div>';
   }).join('');
 
-  var langSwitch = '<select id="langSwitch" class="lang-switch" onchange="window.__i18n.loadLocale(this.value).then(function(){ route(); })"></select>';
+  var langSwitch = '<div class="lang-wrap" id="langWrap" role="group" aria-label="' + langTitle() + '">'
+    + '<button class="icon-btn" id="langToggle" aria-label="' + langTitle() + '" title="' + langTitle() + '" aria-haspopup="listbox" aria-controls="langPop" aria-expanded="false">' + svgIcon('globe', 18) + '</button>'
+    + '<div class="lang-pop" id="langPop" role="listbox" aria-label="' + langTitle() + '">'
+    + '<div class="accent-pop-title">' + langTitle() + '</div>'
+    + '<div class="lang-pop-options" id="langPopInner"></div>'
+    + '</div></div>';
   var themeBtn = '<button class="icon-btn" id="themeToggle" aria-label="' + t('theme.toggle') + '" title="' + t('theme.toggle') + '">' + themeIcon() + '</button>';
   var searchBtn = '<button class="icon-btn search-toggle" id="searchToggle" aria-label="' + t('search.toggle') + '" title="' + t('search.toggle') + '">' + searchIconSvg() + '</button>';
+  var accentSwitch = '<div class="accent-wrap" id="accentWrap" role="group" aria-label="' + accentTitle() + '">'
+    + '<button class="icon-btn" id="accentToggle" aria-label="' + accentTitle() + '" title="' + accentTitle() + '" aria-haspopup="true" aria-expanded="false" aria-controls="accentPop">' + svgIcon('palette', 18) + '</button>'
+    + '<div class="accent-pop" id="accentPop" role="group" aria-label="' + accentTitle() + '">'
+    + '<div class="accent-pop-title">' + accentTitle() + '</div>'
+    + '<div class="accent-pop-swatches"></div>'
+    + '</div></div>';
+  // 背景素描动画开关（春夏秋冬 · 自动切换 · 可一键关闭）
+  var bgAnimOn = !!(window.bgAnim && window.bgAnim.isOn());
+  var bgAnimBtn = '<button class="icon-btn" id="bgAnimToggle" aria-pressed="' + (bgAnimOn ? 'true' : 'false') + '" aria-label="' + t('bgAnim.title') + '" title="' + (bgAnimOn ? t('bgAnim.on') : t('bgAnim.off')) + '">' + svgIcon('spark', 18) + '</button>';
   var hamburger = '<button class="hamburger-btn" id="hamburgerBtn" aria-label="' + t('nav.toggle') + '"><span></span><span></span><span></span></button>';
 
   // 侧边栏导航项（移动端用）
@@ -1118,7 +1524,15 @@ function app() { return document.querySelector('#app'); }
     + '<button class="icon-btn sidebar-theme" id="themeToggleSide" aria-label="' + t('theme.toggle') + '" title="' + t('theme.toggle') + '">' + themeIcon() + '</button>'
     + '<button class="sidebar-close" id="sidebarClose" aria-label="' + t('search.close') + '">✕</button></div>'
     + '<nav class="sidebar-nav">' + sidebarLinks + '</nav>'
-    + '<div class="sidebar-footer"><select id="langSwitchSide" class="lang-switch"></select></div>'
+    + '<div class="sidebar-footer">'
+    + '<div class="sidebar-picks">'
+    + '<select id="langSwitchSide" class="lang-switch" aria-label="' + langTitle() + '"></select>'
+    + '<div class="accent-native-wrap">'
+    + '<span class="accent-dot" id="accentNativeDot" aria-hidden="true"></span>'
+    + '<select id="accentNativeSide" class="lang-switch accent-native" aria-label="' + accentTitle() + '"></select>'
+    + '</div>'
+    + '</div>'
+    + '</div>'
     + '</aside>';
 
   var searchForm = '<form class="topbar-search" id="topbarSearch" role="search" onsubmit="return false">'
@@ -1132,7 +1546,7 @@ function app() { return document.querySelector('#app'); }
     + '<div class="container topbar-inner">'
     + '<div class="topbar-left">' + hamburger + '<a class="brand" href="' + esc(href('/')) + '">' + getSiteName() + '</a></div>'
     + '<nav class="main-nav">' + links + '</nav>'
-    + '<div class="topbar-actions">' + searchBtn + langSwitch + themeBtn + '</div>'
+    + '<div class="topbar-actions">' + searchBtn + langSwitch + accentSwitch + bgAnimBtn + themeBtn + '</div>'
     + searchForm
     + '</div>'
     + '<div class="search-panel" id="searchPanel"></div>'
@@ -1146,13 +1560,13 @@ function renderFooter() {
   var startYear = Number(f.startYear) || 2019;
   var copyRange = (startYear && startYear < year) ? (startYear + '-' + year) : ('' + year);
   var site = getSiteName();
-  // 页脚导航行：优先使用 config.js footer.contact（可自定义、支持外部链接）；
-  // 未配置 contact 时回退到站点主导航 NAV。写作后台仅管理员显示；
+  // 页脚导航行：优先使用后台「底部导航」保存的配置，其次沿用 config.js footer.contact；
+  // 都未配置时回退到站点主导航 NAV。写作后台仅管理员显示；
   // RSS 仅普通用户显示（互斥，避免导航过长）。
-  var custom = (f.contact && f.contact.length) ? f.contact : null;
+  var custom = (cfg.footerNav && cfg.footerNav.length) ? cfg.footerNav : ((f.contact && f.contact.length) ? f.contact : null);
   var nav = custom ? custom.map(function (it) {
     return { text: it.text || '', url: it.url || '/' };
-  }) : resolveNav(NAV);
+  }) : resolveNav(navItems());
   if (adminOk()) nav.push({ text: t('nav.admin'), url: '/admin' });
   function l(x) {
     var u = x.url || '/';
@@ -1172,12 +1586,13 @@ function renderFooter() {
   // 电脑端专属区块：自定义文字 / 站点声明 / 联系方式 / 友情链接
   var extra = '';
   if (f.text) extra += '<p class="footer-text">' + esc(f.text) + '</p>';
-  if (f.decl) extra += '<p class="footer-decl">' + t('footer.declPrefix') + esc(f.decl) + '</p>';
+  if (f.decl) extra += '<p class="footer-decl"><span class="footer-lbl">' + t('footer.declPrefix') + '</span>' + esc(f.decl) + '</p>';
   // 联系邮箱：云端「个人资料 → 联系邮箱」优先，回退静态 config.js footer.email
   var contactEmail = (cfg.profile && cfg.profile.email) || f.email || '';
-  if (contactEmail) extra += '<p class="footer-contact">' + t('footer.contactPrefix') + '<a href="mailto:' + esc(contactEmail) + '">' + esc(contactEmail) + '</a></p>';
-  var friends = (f.links || []).map(l).join('');
-  if (friends) extra += '<p class="footer-friends">' + t('footer.friends') + friends + '</p>';
+  if (contactEmail) extra += '<p class="footer-contact"><span class="footer-lbl">' + t('footer.contactPrefix') + '</span><a href="mailto:' + esc(contactEmail) + '">' + esc(contactEmail) + '</a></p>';
+  var friendsArr = (cfg.friendLinks && cfg.friendLinks.length) ? cfg.friendLinks : (f.links || []);
+  var friends = friendsArr.map(l).join('');
+  if (friends) extra += '<p class="footer-friends"><span class="footer-lbl">' + t('footer.friends') + '</span><span class="footer-friend-links">' + friends + '</span></p>';
   // 版权行（移动端仅显示此行，备案号在移动端隐藏）
   // 版权署名：云端「页脚版权署名」优先显示；若未设置则使用站点名称
   var copyName = (cfg.site && cfg.site.copyright) || site;
@@ -1199,14 +1614,17 @@ function homePageSize() {
 }
 
 /* 计算当前分页并渲染「卡片列表 + 翻页器」 */
-function homeListHtml(filtered, ads, adsEnabled, page, pageSize, emptyMsg) {
+function homeListHtml(filtered, ads, adsEnabled, page, pageSize, emptyMsg, emptyExtra) {
   var total = filtered.length;
   var totalPages = pageSize > 0 ? Math.max(1, Math.ceil(total / pageSize)) : 1;
   if (page < 1) page = 1;
   if (page > totalPages) page = totalPages;
   var pageItems = pageSize > 0 ? filtered.slice((page - 1) * pageSize, page * pageSize) : filtered;
   var list = renderCardList(pageItems, ads, adsEnabled);
-  if (!pageItems.length) list = '<div class="empty"><div class="big">' + svgIcon('doc', 36) + '</div><p>' + (emptyMsg || t('home.noPosts')) + '</p></div>';
+  if (!pageItems.length) {
+    list = '<div class="empty"><div class="big">' + svgIcon('doc', 36) + '</div><p>' + (emptyMsg || t('home.noPosts')) + '</p>'
+      + (emptyExtra || '') + '</div>';
+  }
   var pager = pagerHtml(page, totalPages);
   // 不分页时翻页器不渲染，其 32px 下边距随之消失，末尾文章会贴住底部导航 ——
   // 此时给列表容器加 list-nopager 类，由 CSS 补齐同等间距
@@ -1229,7 +1647,7 @@ function pagerHtml(page, totalPages) {
 
 function renderHome() {
   var cfg = getConfig();
-  var posts = sortPagePosts(getStaticPosts());
+  var posts = sortPagePosts(getPublishedPosts());
   var cur = currentRoute();
   var tag = cur.query.tag || '';
   var ads = cfg.ads || {};
@@ -1244,11 +1662,46 @@ function renderHome() {
   html += renderHomeTagRow(posts, tag);
   if (adsEnabled && ads.belowSearch) html += '<div class="ad-slot"><span class="ad-label">' + t('ad.label') + '</span>' + ads.belowSearch + '</div>';
   var filtered = tag ? posts.filter(function (p) { return (p.tags || []).indexOf(tag) >= 0; }) : posts;
-  var body = homeListHtml(filtered, ads, adsEnabled, page, pageSize);
+  var body;
+  // 云端探测中且尚无数据 → 显示加载动画（避免先渲染「还没有文章」空态，等数据到了才变列表）
+  var cloudProbing = !_cloudReady && (cfg.mode === 'api' || cfg.mode === 'auto');
+  if (cloudProbing && !filtered.length) {
+    body = { html: '<div id="listContainer" class="list-nopager">' + homeLoadingHtml() + '</div>', page: 1, totalPages: 1 };
+  } else {
+    // 云端已确认在线且列表为空 → 「你还未发布文章」+ 写文章引导；静态空（或探测失败）→ 原「还没有文章」
+    var cloudEmpty = _cloudReady && _cloudOn() && !filtered.length;
+    var emptyMsg = cloudEmpty ? t('home.noPostsCloud') : t('home.noPosts');
+    var emptyExtra = cloudEmpty
+      ? '<a class="btn btn-sm btn-primary" style="margin-top:14px" href="' + esc(href('/admin/posts/new')) + '" data-no-hijack="1">' + svgIcon('pen', 14) + ' ' + t('admin.dashboard.goWrite') + '</a>'
+      : '';
+    body = homeListHtml(filtered, ads, adsEnabled, page, pageSize, emptyMsg, emptyExtra);
+  }
   html += '<div id="homeBody">' + body.html + '</div>';
   html += '</main>';
   html += renderFooter();
   return html;
+}
+
+/* 云端文章加载动画：与首页卡片同构的骨架屏（shimmer），顶部一行「正在拉取文章…」 */
+function homeLoadingHtml() {
+  var card = function () {
+    return '<div class="sk-card">'
+      + '<div class="sk-card-main">'
+      + '<div class="sk-line sk-meta"></div>'
+      + '<div class="sk-line sk-title"></div>'
+      + '<div class="sk-line" style="width:90%"></div>'
+      + '<div class="sk-line" style="width:65%;height:12px"></div>'
+      + '<div class="sk-row">'
+      + '<span class="sk-chip"></span><span class="sk-chip"></span><span class="sk-chip"></span>'
+      + '</div>'
+      + '</div>'
+      + '<div class="sk-thumb"></div>'
+      + '</div>';
+  };
+  return '<div class="home-loading" role="status" aria-label="' + esc(t('home.loadingCloud')) + '">'
+    + '<div class="home-loading-head">' + svgIcon('spinner', 15) + '<span>' + esc(t('home.loadingCloud')) + '</span></div>'
+    + '<div class="home-loading-grid">' + card() + card() + card() + '</div>'
+    + '</div>';
 }
 
 function searchIconSvg() {
@@ -1284,33 +1737,47 @@ function renderCardList(plist, ads, adsEnabled) {
   var out = '';
   plist.forEach(function (p, idx) {
     if (adsEnabled && ads.between && idx > 0 && idx % every === 0) out += '<div class="ad-slot"><span class="ad-label">' + t('ad.label') + '</span>' + ads.between + '</div>';
-    out += renderCard(p);
+    out += renderCard(p, idx);
   });
   return out;
 }
 
-function renderCard(p) {
+function renderCard(p, idx) {
   var badges = '';
   if (p.pinned) badges += '<span class="pin">' + svgIcon('pin', 13) + ' ' + t('post.pin') + '</span>';
   var tags = normalizeTags(p).map(function (t) { return '<span>' + esc(t) + '</span>'; }).join('');
   var excerpt = p.excerpt || stripMd(p.content || '').slice(0, 100);
+  // 云端可 AI 摘要的文章：摘要位标记 data-ai-excerpt，aiFillSlots 异步拉取 AI 摘要后替换；
+  // 没有 AI 摘要（未生成/未启用/拉取失败）时保持默认摘要兜底
+  var aiExcerpt = (_cloudOn() && !p.enc && !(Number(p.protected || 0) === 1))
+    ? ' data-ai-excerpt="' + esc(p.id) + '"'
+    : '';
   return '<a class="post-card" href="' + esc(href(postUrl(p.id))) + '">'
     + '<div class="post-card-main">'
     + '<div class="meta"><span class="date">' + esc(p.date || '') + '</span>' + badges + '</div>'
     + '<h2>' + esc(p.title || '') + '</h2>'
-    + '<div class="excerpt">' + esc(excerpt) + '</div>'
-    + (tags ? '<div class="mini-tags">' + tags + '</div>' : '')
+    + '<div class="excerpt"' + aiExcerpt + '>' + esc(excerpt) + '</div>'
+    // 标签区恒渲染（无标签时为空容器）：固定高度占位，保证每张卡片等高、布局协调
+    + '<div class="mini-tags">' + (tags || '') + '</div>'
     + '</div>'
-    + renderPostThumb(p)
+    + renderPostThumb(p, idx)
     + '</a>';
 }
 
-/** 文章缩略图：优先 cover 字段，其次正文第一张图；有图仅显示图，无图显示主题渐变占位（中性图片图标） */
-function renderPostThumb(p) {
+/** 文章缩略图：优先 cover 字段，其次正文第一张图；有图仅显示图，无图显示主题渐变占位（中性图片图标）。
+ *  加载速度优化：
+ *   · 前 2 张（首屏可视区）给 fetchpriority="high"，其余 "low" —— 浏览器优先拉取首屏图，
+ *     避免首屏外大图抢占带宽导致首屏缩略图"慢慢加载"；
+ *   · decoding="async"：图片解码不阻塞主线程渲染；
+ *   · onload 加 .thumb-in 类 → CSS 淡入（见 style.css），替代"啪地弹出"；
+ *   · loading="lazy" + referrerpolicy 保留既有行为。 */
+function renderPostThumb(p, idx) {
   var url = String((p && p.cover) || '').trim() || firstImageFrom(p && p.content);
   var title = (p && p.title) || '';
   if (url) {
-    return '<span class="post-thumb has-img"><img src="' + esc(url) + '" alt="' + esc(title || t('post.thumbnailAlt')) + '" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()"></span>';
+    var pri = (idx !== undefined && idx < 2) ? 'high' : 'low';
+    var lazy = (idx !== undefined && idx < 2) ? 'eager' : 'lazy';
+    return '<span class="post-thumb has-img"><img src="' + esc(url) + '" alt="' + esc(title || t('post.thumbnailAlt')) + '" loading="' + lazy + '" decoding="async" fetchpriority="' + pri + '" referrerpolicy="no-referrer" onload="this.classList.add(\'thumb-in\')" onerror="this.remove()"></span>';
   }
   return '<span class="post-thumb ph"><span class="post-thumb-ph">' + svgIcon('image', 26) + '</span></span>';
 }
@@ -1322,6 +1789,64 @@ function firstImageFrom(content) {
   if (m) return m[1];
   var m2 = s.match(/<img[^>]+src=["'](https?:[^"']+)["']/i);
   return m2 ? m2[1] : '';
+}
+
+/* ---------- 手机卡片摘要行数自适应 ----------
+ * 手机端（≤768px）：标题实际渲染行数决定摘要可显示行数，把标签上方留白让给摘要：
+ *   · 标题 1 行 → 摘要最多 4 行（加 .clamp-4）
+ *   · 标题 2 行 → 摘要最多 3 行（默认）
+ * iOS Safari（iPhone）特化：禁止系统字号放大（-webkit-text-size-adjust 见 CSS），
+ * 行数与字号在横竖屏旋转后保持一致；这里用 Range.getClientRects 数行，
+ * 该 API 在 iOS/安卓 Safari/Chrome/Firefox 均稳定，且在 -webkit-line-clamp 约束下返回
+ * 实际可见的行盒，不会受摘要是否 clamp 影响。
+ * 桌面/平板（>768px）不执行 —— 摘要固定 3 行由 CSS 负责。 */
+function countRenderedLines(el) {
+  if (!el || !el.firstChild) return 1;
+  try {
+    var range = document.createRange();
+    range.setStart(el.firstChild, 0);
+    var last = el.lastChild;
+    // 结束于最后一个文本节点（标题是纯文本，lastChild 即为文本节点）
+    range.setEnd(last, last.nodeType === 3 ? last.data.length : (last.childNodes && last.childNodes.length) || 1);
+    var rects = range.getClientRects();
+    var top = null;
+    var lines = 0;
+    for (var i = 0; i < rects.length; i++) {
+      var r = rects[i];
+      if (!r || r.height <= 0) continue;   // 跳过零高行盒（换行产生的空行）
+      if (top === null || Math.abs(r.top - top) > 1) { lines++; top = r.top; }   // 按行顶坐标去重
+    }
+    return Math.max(1, lines);
+  } catch (e) { return 1; }
+}
+function fitCardLineClamps() {
+  // 仅手机尺寸（≤768px）执行
+  var mq = null;
+  try { mq = window.matchMedia('(max-width: 768px)'); } catch (e) {}
+  if (!mq || !mq.matches) return;
+  var cards = document.querySelectorAll('.post-card');
+  Array.prototype.forEach.call(cards, function (card) {
+    var h2 = card.querySelector('h2');
+    var ex = card.querySelector('.excerpt');
+    if (!h2 || !ex || !ex.classList) return;
+    var lines = countRenderedLines(h2);
+    if (lines <= 1) ex.classList.add('clamp-4');
+    else ex.classList.remove('clamp-4');
+  });
+}
+function bindFitCardLineClamps() {
+  if (window.__fitCardBound) return;
+  window.__fitCardBound = true;
+  // 旋转/横竖屏切换后重测（iPhone 从竖屏 393px 转到横屏 852px，行数变化）
+  var timer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(timer);
+    timer = setTimeout(fitCardLineClamps, 120);
+  });
+  // 字体加载完成后再测一次（iOS 首屏字体 swapping 会使标题行数变化）
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(function () { fitCardLineClamps(); }).catch(function () {});
+  }
 }
 
 /* ---------- 文章详情本地缓存 ----------
@@ -1401,22 +1926,28 @@ function renderCommentTree(list, canDel) {
       ? '<button class="comment-del" data-cid="' + esc(c.id) + '">' + t('comment.delete') + '</button>'
       : '';
     // 在内容下方标注“回复了某人”（若该评论是回复）
+    // 安全：t() 的插值不做转义，作者名可能含 HTML（服务端只清控制字符），
+    // 必须对整个结果 esc 再进 innerHTML（同 admin.js 的 comment.replyTo 用法），
+    // 否则父评论作者名可构造存储型 XSS（他人回复时对所有访客触发）。
     var replyToLabel = '';
     if (c.parent_id && byId[c.parent_id]) {
-      replyToLabel = '<div class="comment-reply-to">' + t('comment.replyTo', { author: byId[c.parent_id].author }) + '</div>';
+      replyToLabel = '<div class="comment-reply-to">' + esc(t('comment.replyTo', { author: byId[c.parent_id].author })) + '</div>';
     }
     var childrenHtml = replies.length
       ? '<ul class="comment-children">' + replies.map(function (r) { return renderOne(r, depth + 1); }).join('') + '</ul>'
       : '';
+    var initial = String(c.author || '?').trim().slice(0, 1) || '?';
     return '<li class="comment" data-id="' + esc(c.id) + '"><div class="comment-head">'
+      + '<span class="comment-avatar" aria-hidden="true">' + esc(initial) + '</span>'
       + '<span class="comment-author">' + esc(c.author) + '</span>'
       + '<span class="comment-date">' + esc(c.date || '') + '</span>'
-      + replyBtn
-      + delBtn
+      + '<span class="comment-actions">' + replyBtn + delBtn + '</span>'
       + '</div>'
+      + '<div class="comment-main">'
       + replyToLabel
-      + '<div class="comment-content">' + esc(c.content) + '</div>'
-      + childrenHtml + '</li>';
+      + '<div class="comment-content">' + escSmoji(esc(c.content)) + '</div>'
+      + childrenHtml
+      + '</div></li>';
   }
 
   return roots.map(function (c) { return renderOne(c, 0); }).join('');
@@ -1425,10 +1956,21 @@ function renderCommentTree(list, canDel) {
 async function renderPost(id) {
   var cur = currentRoute();
   var html = renderNav(cur.path);
-  var posts = getStaticPosts();
+  var posts = getPublishedPosts();
   var post = posts.find(function (p) { return p.id === id; });
   html += '<main class="container page-fade"><div class="post-body">';
   if (!post) {
+    // 云端列表尚未拉取完成（boot 探测中）时不能急于下结论：刷新文章页会出现
+    // 「内容不存在」一闪而过（内容刚加载出来前先闪红字再变正常）。
+    // 此时先显示加载态，等 boot 完成后 route() 重渲染再给出定论（存在→正文 / 不存在→404）。
+    var cfgNow = getConfig();
+    var cloudPending = (cfgNow.mode === 'api' || cfgNow.mode === 'auto') && !_cloudReady;
+    if (cloudPending) {
+      html += '<div class="empty"><div class="big">' + svgIcon('spinner', 26) + '</div><p>' + t('site.loading') + '…</p></div></div></main>';
+      html += renderFooter();
+      app().innerHTML = html;
+      return;
+    }
     html += '<div class="empty"><div class="big">' + svgIcon('question', 36) + '</div><p>' + t('post.notFound') + '</p><p><a href="' + esc(href('/')) + '">' + t('post.backHome') + '</a></p></div></div></main>';
     html += renderFooter();
     app().innerHTML = html;
@@ -1455,13 +1997,24 @@ async function renderPost(id) {
     }
     // 超时保护：10 秒拿不到正文就放弃加载态，避免“一直加载中”
     var settled = false;
-    function finish(data) {
+    function finish(data, err) {
       if (settled) return;
       settled = true;
       var full = (data && data.post) || null;
       if (!full) {
         post._fullLoaded = true;
-        if (!hasContent && !fromCache) route();   // 无缓存且拉取失败：结束加载态
+        if (!hasContent && !fromCache) {
+          // 文章已被删除（404/不存在）：从本地列表移除并重渲染 → 显示「内容不存在」，终止无限拉取
+          if (err && /404|410|not.?found|不存在|未找到|找不到/i.test(String((err && err.message) || err))) {
+            if (Array.isArray(window.BLOG_POSTS)) {
+              window.BLOG_POSTS = window.BLOG_POSTS.filter(function (p) { return p && p.id !== post.id; });
+            }
+            route();
+            return;
+          }
+          // 网络/超时类失败：渲染静态失败页（可手动重试），不再自动循环拉取
+          renderPostFail(post);
+        }
         return;
       }
       var changed = full.content !== undefined && full.content !== post.content;
@@ -1472,9 +2025,9 @@ async function renderPost(id) {
     }
     apiFetch('api/posts/' + encodeURIComponent(post.id))
       .then(function (data) { finish(data); })
-      .catch(function () { finish(null); });
+      .catch(function (err) { finish(null, err); });
     setTimeout(function () { finish(null); }, 10000);
-    if (!post.content) return;   // 无内容（含无缓存）：等待拉取后重渲染
+    if (!post.content) return;   // 无内容（含无缓存）：等待拉取后重渲染或显示失败页
     // 有内容（缓存或已加载）：继续渲染正文，后台拉取完成后若有更新会重渲染
   }
   var content = post.content || '';
@@ -1485,6 +2038,7 @@ async function renderPost(id) {
   var tags = normalizeTags(post).map(function (t) { return '<a href="' + esc(href('/', { tag: t })) + '" data-tag-link>' + esc(t) + '</a>'; }).join('');
   var minutes = Math.max(1, Math.ceil((stripMd(content || '').length / 400)));
   html += '<div class="post-header"><h1>' + esc(post.title || '') + '</h1><div class="meta"><span class="meta-date">' + esc(post.date || '') + '</span><span class="meta-dot">·</span><span>' + minutes + ' ' + t('post.minRead') + '</span><span class="meta-dot">·</span><span class="meta-views">' + svgIcon('eye', 14) + ' <span id="viewCount">0</span> ' + t('post.views') + '</span>' + (post.pinned ? '<span class="pin">' + svgIcon('pin', 13) + ' ' + t('post.pin') + '</span>' : '') + '</div></div>';
+  html += aiPostSlot(post);
   html += toc;
   html += '<article class="article">' + bodyHtml + '</article>';
   // 点赞：正文尾部，水平居中
@@ -1518,7 +2072,7 @@ async function renderPost(id) {
   html += '<div class="comments"><h3>' + t('comment.title') + ' <span class="comment-count" id="commentCount">' + '0' + '</span></h3>';
   html += '<p class="comment-hint">' + t('comment.hint') + '</p>';
   html += '<div class="reply-indicator" id="replyIndicator" style="display:none"><span id="replyTo"></span><button class="reply-cancel" id="replyCancel">✕</button></div>';
-  html += '<div class="comment-form"><input type="text" id="commentAuthor" maxlength="30" placeholder="' + t('comment.authorPlaceholder') + '"><textarea id="commentContent" rows="2" maxlength="1000" placeholder="' + t('comment.contentPlaceholder') + '"></textarea><div class="comment-submit-row"><button class="btn btn-primary" id="commentSubmit">' + t('comment.submit') + '</button><span class="c-status" id="commentStatus"></span></div></div>';
+  html += '<div class="comment-form"><input type="text" id="commentAuthor" maxlength="30" placeholder="' + t('comment.authorPlaceholder') + '"><div class="comment-editor-row"><textarea id="commentContent" rows="2" maxlength="1000" placeholder="' + t('comment.contentPlaceholder') + '"></textarea><button type="button" class="comment-emoji-btn" id="commentEmoji" title="' + t('comment.emoji') + '" aria-label="' + t('comment.emoji') + '">😊</button></div><div class="comment-submit-row"><button class="btn btn-primary" id="commentSubmit">' + t('comment.submit') + '</button><span class="c-status" id="commentStatus"></span></div></div>';
   html += '<ul class="comment-list" id="commentList"></ul></div>';
 
   // 精选文章（评论区下方）
@@ -1599,6 +2153,11 @@ async function renderPost(id) {
     if (indicator) { indicator.style.display = 'none'; indicator.removeAttribute('data-reply-id'); }
   });
 
+  // 评论框表情选择器
+  var commentEmoji = document.querySelector('#commentEmoji');
+  var commentContent = document.querySelector('#commentContent');
+  if (commentEmoji && commentContent && window.initSmojiPicker) window.initSmojiPicker(commentEmoji, commentContent);
+
   var submit = document.querySelector('#commentSubmit');
   if (submit) submit.addEventListener('click', async function () {
     var a = document.querySelector('#commentAuthor');
@@ -1624,8 +2183,19 @@ async function renderPost(id) {
   });
 }
 
+/* 正文加载失败（网络/超时）时渲染的静态失败页：保留标题，提供手动重试，不再自动循环拉取 */
+function renderPostFail(post) {
+  var html = renderNav(currentRoute().path);
+  html += '<main class="container page-fade"><div class="post-body"><div class="post-header"><h1>' + esc(post.title || t('post.untitled')) + '</h1><div class="meta"><span class="meta-date">' + esc(post.date || '') + '</span></div></div>';
+  html += '<div class="empty" style="padding:44px 0"><div class="big">' + svgIcon('cloud', 32) + '</div><p>' + t('post.loadFail') + '</p><p style="margin-top:14px"><button class="btn btn-primary" id="retryPostBtn">' + svgIcon('refresh', 14) + ' ' + t('post.retry') + '</button> <a class="btn" href="' + esc(href('/')) + '">' + t('post.backHome') + '</a></p></div>';
+  html += '</div></main>' + renderFooter();
+  app().innerHTML = html;
+  var retry = document.querySelector('#retryPostBtn');
+  if (retry) retry.addEventListener('click', function () { route(); });
+}
+
 function renderArchive() {
-  var posts = sortPagePosts(getStaticPosts());
+  var posts = sortPagePosts(getPublishedPosts());
   var byYear = {};
   posts.forEach(function (p) {
     var yr = (p.date || '').slice(0, 4) || t('archive.unknown');
@@ -1653,7 +2223,7 @@ function renderArchive() {
 }
 
 function renderAbout() {
-  var posts = getStaticPosts();
+  var posts = getPublishedPosts();
   var tags = {};
   var totalWords = 0;
   var latest = '';
@@ -1686,7 +2256,7 @@ function renderAbout() {
   var profBio = prof.bio || '';
   if (profName || profAvatar || profBio) {
     html += '<div class="about-author card">';
-    if (profAvatar) html += '<img class="about-author-avatar" src="' + esc(profAvatar) + '" alt="' + esc(profName || 'avatar') + '">';
+    if (profAvatar) html += '<img class="about-author-avatar" src="' + esc(profAvatar) + '" alt="' + esc(profName || 'avatar') + '" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
     html += '<div class="about-author-info">';
     if (profName) html += '<div class="about-author-name">' + esc(profName) + '</div>';
     if (profBio) html += '<div class="about-author-bio">' + esc(profBio) + '</div>';
@@ -1700,7 +2270,7 @@ function renderAbout() {
 }
 
 function renderTags() {
-  var posts = getStaticPosts();
+  var posts = getPublishedPosts();
   var counts = {};
   posts.forEach(function (p) {
     normalizeTags(p).forEach(function (t) { counts[t] = (counts[t] || 0) + 1; });
@@ -1752,7 +2322,9 @@ function renderGuestbook() {
     + '</div>'
     + '<div class="gb-kind-hint" id="gbKindHint">' + svgIcon('pen', 13) + ' <span></span></div>'
     + '<textarea id="gbContent" rows="3" maxlength="1000" placeholder="' + t('guestbook.contentPlaceholder') + '"></textarea>'
-    + '<div class="gb-form-foot"><span class="gb-status" id="gbStatus"></span>'
+    + '<div class="gb-form-foot">'
+    + '<button type="button" class="gb-emoji-btn" id="gbEmoji" title="' + t('guestbook.emoji') + '" aria-label="' + t('guestbook.emoji') + '">😊</button>'
+    + '<span class="gb-status" id="gbStatus"></span>'
     + '<span class="gb-count" id="gbCount"></span></div>'
     + '</div>'
     // 留言列表
@@ -1800,7 +2372,7 @@ async function bindGuestbook() {
         + '<span class="gb-kind-badge ' + kindClass + '">' + kindLabel + '</span>'
         + '<span class="gb-date">' + esc(c.date || '') + '</span>'
         + '</div>'
-        + '<div class="gb-entry-content">' + esc(c.content || '') + '</div>'
+        + '<div class="gb-entry-content">' + escSmoji(esc(c.content || '')) + '</div>'
         + '</div>';
     }).join('');
     if (count) count.textContent = String(entries.length);
@@ -1840,6 +2412,9 @@ async function bindGuestbook() {
       status.textContent = (e && e.message) || t('guestbook.fail');
     } finally { submit.disabled = false; }
   }
+
+  var gbEmoji = document.querySelector('#gbEmoji');
+  if (gbEmoji && content && window.initSmojiPicker) window.initSmojiPicker(gbEmoji, content);
 
   refreshUI();
   load();
@@ -1896,6 +2471,7 @@ function renderPostList() {
     + '<div class="admin-head-titles"><h2>' + svgIcon('doc', 20) + ' ' + t('admin.postList.title') + '</h2><p class="admin-head-sub">' + t('admin.postList.desc') + '</p></div>'
     + '<a class="btn btn-primary btn-new-post" href="' + esc(href('/admin/write')) + '">' + svgIcon('pen', 14) + ' ' + t('editor.newPost') + '</a>'
     + '</div>';
+  html += aiCommentsSlotHTML();
   html += '<div class="admin-stats">'
     + '<div class="admin-stat"><span class="admin-stat-num">' + posts.length + '</span><span class="admin-stat-label">' + t('admin.postList.allStatus') + '</span></div>'
     + '<div class="admin-stat"><span class="admin-stat-num">' + pinnedCount + '</span><span class="admin-stat-label">' + t('admin.postList.pin') + '</span></div>'
@@ -2028,6 +2604,7 @@ function renderEditorBody() {
     + '<div class="field field-full"><label>' + t('editor.coverPlaceholder') + '</label><input type="text" id="coverInput" placeholder="' + t('editor.coverHint') + '"></div>'
     + '<div class="field check-label"><label><input type="checkbox" id="pinnedInput"> ' + svgIcon('pin', 13) + ' ' + t('editor.pin') + '</label></div>'
     + '</div></div>';
+  body += aiAssistSlotHTML();
   body += '<div class="editor-wrap">'
     + '<section class="editor-pane"><div class="pane-head">' + svgIcon('pen', 13) + ' ' + t('editor.editing') + '<span class="pane-note">Markdown</span></div><div id="toolbar" class="toolbar">' + toolbarHtml() + '</div><textarea id="mdInput" class="md-input" rows="18" placeholder="' + t('editor.writeHint') + '"></textarea></section>'
     + '<section class="editor-pane preview-pane"><div class="pane-head">' + svgIcon('eye', 13) + ' ' + t('editor.preview') + '<span class="pane-note">' + t('editor.realtimeRender') + '</span></div><div class="write-preview article preview-body" id="previewPane"></div></section>'
@@ -2059,13 +2636,21 @@ function renderWrite() {
   html += '<main class="container page-fade write-page">';
   if (!adminOk()) {
     if (_cloudOn()) {
-      // 云端模式：密码校验于 Cloudflare D1 后端，此页只做登录（token 已存则直接进入编辑）
+      // 云端模式：密码校验于 Cloudflare D1 后端，此页只做登录（token 已存则直接进入编辑）。
+      // 首次部署：登录框下方提供「安装密钥初始化」入口（后端 BLOG_ADMIN_SETUP_KEY 必填）。
       html += '<div class="card gate-card">'
         + '<div class="gate-badge">' + svgIcon('lock', 26) + '</div>'
         + '<h3 class="gate-title">' + t('admin.login') + '</h3>'
         + '<p class="gate-sub">' + t('admin.loginHint') + '</p>'
         + '<div class="gate-form"><input type="password" id="gatePwd" placeholder="' + t('admin.pwdLabel') + '" autocomplete="current-password"><button class="btn btn-primary" id="btnGate">' + svgIcon('logout', 15) + ' ' + t('admin.loginBtn') + '</button></div>'
         + '<div class="gate-msg alert-strip" id="gateMsg"></div>'
+        + '<button type="button" class="gate-link" id="btnCloudSetup">' + t('admin.gotoCloudSetup') + '</button>'
+        + '<div class="gate-form" id="gateSetupForm" style="display:none">'
+        + '<input type="password" id="setupKey" placeholder="' + t('admin.setupKeyLabel') + '" autocomplete="off">'
+        + '<input type="password" id="setupPwd2" placeholder="' + t('admin.pwdLabel') + '" autocomplete="new-password">'
+        + '<button class="btn btn-primary" id="btnCloudSetupGo">' + t('admin.setupBtn') + '</button>'
+        + '<button type="button" class="gate-link" id="btnCloudSetupBack">' + t('admin.backToLogin') + '</button>'
+        + '</div>'
         + '<div class="gate-foot"><a href="' + esc(href('/')) + '">' + t('admin.backHome') + '</a></div>'
         + '</div>';
     } else if (needAdminSetup()) {
@@ -2127,7 +2712,7 @@ function renderWrite() {
       else if (msg) msg.textContent = t('admin.wrongPwd');
     });
     // 回车即提交 + 自动聚焦密码框
-    [['#setupPwd', '#btnSetup'], ['#gatePwd', '#btnGate']].forEach(function (pair) {
+    [['#setupPwd', '#btnSetup'], ['#gatePwd', '#btnGate'], ['#setupPwd2', '#btnCloudSetupGo'], ['#setupKey', '#btnCloudSetupGo']].forEach(function (pair) {
       var inp = document.querySelector(pair[0]);
       var btn = document.querySelector(pair[1]);
       if (inp && btn) {
@@ -2136,6 +2721,45 @@ function renderWrite() {
         });
         try { inp.focus(); } catch (e) {}
       }
+    });
+    // 云端首次部署：登录 ↔ 安装密钥初始化 切换
+    var cloudSetupBtn = document.querySelector('#btnCloudSetup');
+    var cloudSetupForm = document.querySelector('#gateSetupForm');
+    var cloudSetupBack = document.querySelector('#btnCloudSetupBack');
+    var gateMsg = document.querySelector('#gateMsg');
+    function cloudToggleSetup(show) {
+      if (!cloudSetupForm) return;
+      cloudSetupForm.style.display = show ? 'block' : 'none';
+      var loginForm = cloudSetupForm.parentNode && cloudSetupForm.parentNode.querySelector('#gatePwd');
+      if (show) {
+        if (cloudSetupBtn) cloudSetupBtn.style.display = 'none';
+        var k = document.querySelector('#setupKey');
+        if (k) { try { k.focus(); } catch (e) {} }
+      } else {
+        if (cloudSetupBtn) cloudSetupBtn.style.display = '';
+        if (loginForm) { try { loginForm.focus(); } catch (e) {} }
+      }
+      if (gateMsg) gateMsg.textContent = '';
+    }
+    if (cloudSetupBtn) cloudSetupBtn.addEventListener('click', function () { cloudToggleSetup(true); });
+    if (cloudSetupBack) cloudSetupBack.addEventListener('click', function () { cloudToggleSetup(false); });
+    var cloudSetupGo = document.querySelector('#btnCloudSetupGo');
+    if (cloudSetupGo) cloudSetupGo.addEventListener('click', async function () {
+      var k = document.querySelector('#setupKey');
+      var p = document.querySelector('#setupPwd2');
+      var m = document.querySelector('#gateMsg');
+      var pwd = p ? p.value : '';
+      var key = k ? k.value : '';
+      if (!pwd) { if (m) m.textContent = t('admin.pwdRequired'); return; }
+      if (!key) { if (m) m.textContent = t('admin.pwdRequired'); return; }  // 复用：提示必填
+      var orig = cloudSetupGo.innerHTML;
+      cloudSetupGo.disabled = true;
+      cloudSetupGo.innerHTML = svgIcon('spinner', 14) + ' ' + t('admin.logging');
+      var r = await cloudSetupAdmin(pwd, key);
+      cloudSetupGo.disabled = false;
+      cloudSetupGo.innerHTML = orig;
+      if (r && r.ok) { route(); }
+      else if (m) m.textContent = (r && r.message) || t('admin.wrongPwd');
     });
     return;
   }
@@ -2170,7 +2794,7 @@ function renderWrite() {
       var st = document.querySelector('#saveStatus'); if (st) st.textContent = t('editor.editingStatus') + (post.title || '');
       // also update page title for tests
       var hTitle = document.querySelector('#writeTitleHint'); if (hTitle) hTitle.textContent = t('editor.editingStatus') + (post.title || '');
-      updatePreview();
+      // 云端正文拉取由 loadEditContent 内部触发预览；本地内容由下方统一 updatePreview() 渲染
       loadEditContent(post, editId);
     }
   }
@@ -2179,10 +2803,11 @@ function renderWrite() {
   bindWriteEvents();
 }
 function toolbarHtml() {
-  return ['bold', 'italic', 'code', 'h2', 'link', 'img', 'quote', 'ul', 'ol', 'fence'].map(function (cmd) {
+  var html = ['bold', 'italic', 'code', 'h2', 'link', 'img', 'quote', 'ul', 'ol', 'fence'].map(function (cmd) {
     var icons = { bold: 'B', italic: 'I', code: '<>', h2: 'H2', link: svgIcon('link', 13), img: svgIcon('image', 13), quote: svgIcon('quote', 13), ul: '•', ol: '1.', fence: '```' };
     return '<button type="button" class="tb-btn" data-cmd="' + cmd + '" title="' + cmd + '">' + (icons[cmd] || cmd) + '</button>';
   }).join('');
+  return html + '<button type="button" class="tb-btn" id="tbSmoji" title="' + t('admin.editor.emoji') + '" aria-label="' + t('admin.editor.emoji') + '">😊</button>';
 }
 
 /** 当前编辑的文章别名：来自路由 /posts/<别名>/edit 或 ?edit= */
@@ -2265,6 +2890,10 @@ function bindWriteEvents() {
     } catch (e) {}
   });
 
+  var tbSmoji = document.querySelector('#tbSmoji');
+  var tbSmojiArea = document.querySelector('#mdInput');
+  if (tbSmoji && tbSmojiArea && window.initSmojiPicker) window.initSmojiPicker(tbSmoji, tbSmojiArea);
+
   document.querySelectorAll('#toolbar [data-cmd]').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var cmd = btn.getAttribute('data-cmd');
@@ -2313,7 +2942,7 @@ function bindWriteEvents() {
 
   var btnRss = document.querySelector('#btnRss');
   if (btnRss) btnRss.addEventListener('click', function () {
-    saveFileFriendly('feed.xml', buildFeedXmlClient(getStaticPosts(), 20), t('export.exported') + ' feed.xml', t('export.downloaded') + ' feed.xml');
+    saveFileFriendly('feed.xml', buildFeedXmlClient(getPublishedPosts(), 20), t('export.exported') + ' feed.xml', t('export.downloaded') + ' feed.xml');
   });
 
   var btnSitemap = document.querySelector('#btnSitemap');
@@ -2325,7 +2954,7 @@ function bindWriteEvents() {
   var btnExportAll = document.querySelector('#btnExportAll');
   if (btnExportAll) btnExportAll.addEventListener('click', function () {
     saveFileFriendly('posts.js', buildPostsJs(), t('export.exported') + ' posts.js', t('export.downloaded') + ' posts.js');
-    saveFileFriendly('feed.xml', buildFeedXmlClient(getStaticPosts(), 20), t('export.exported') + ' feed.xml', t('export.downloaded') + ' feed.xml');
+    saveFileFriendly('feed.xml', buildFeedXmlClient(getPublishedPosts(), 20), t('export.exported') + ' feed.xml', t('export.downloaded') + ' feed.xml');
     saveFileFriendly('sitemap.xml', buildSitemapClient(), t('export.exported') + ' sitemap.xml', t('export.downloaded') + ' sitemap.xml');
   });
 
@@ -2431,115 +3060,13 @@ function renderAdmin() {
   html += '</div></div>';
   html += '</main>' + renderFooter();
   app().innerHTML = html;
-  
-  // --- 绑定编辑器事件（与 renderWrite 保持一致） ---
-  var btnClearData = document.querySelector('#btnClearData');
-  if (btnClearData) btnClearData.addEventListener('click', function () {
-    if (!confirm(t('editor.clearConfirm'))) return;
-    var title = document.querySelector('#titleInput');
-    var date = document.querySelector('#dateInput');
-    var tags = document.querySelector('#tagInput');
-    var excerpt = document.querySelector('#excerptInput');
-    var md = document.querySelector('#mdInput');
-    var preview = document.querySelector('#previewPane');
-    var wordCount = document.querySelector('#wordCount');
-    var hint = document.querySelector('#writeTitleHint');
-    if (title) title.value = '';
-    if (date) date.value = '';
-    if (tags) tags.value = '';
-    if (excerpt) excerpt.value = '';
-    if (md) { md.value = ''; md.dispatchEvent(new Event('input')); }
-    if (preview) preview.innerHTML = '';
-    if (wordCount) wordCount.textContent = '0 ' + t('editor.wordUnit');
-    if (hint) hint.textContent = t('editor.newPost');
-    localStorage.removeItem('qingyu.edit.id');
-  });
 
-  var btnToday = document.querySelector('#btnToday');
-  if (btnToday) {
-    btnToday.addEventListener('click', function () {
-      var input = document.querySelector('#dateInput');
-      if (!input) return;
-      var now = new Date();
-      var year = now.getFullYear();
-      var month = String(now.getMonth() + 1).padStart(2, '0');
-      var day = String(now.getDate()).padStart(2, '0');
-      var hours = String(now.getHours()).padStart(2, '0');
-      var minutes = String(now.getMinutes()).padStart(2, '0');
-      input.value = year + '-' + month + '-' + day + 'T' + hours + ':' + minutes;
-      if (typeof previewContent === 'function') previewContent();
-    });
-  }
-
-  var btnDraft = document.querySelector('#btnSaveDraft');
-  if (btnDraft) btnDraft.addEventListener('click', function () { saveDraft(); });
-
-  var btnImport = document.querySelector('#btnImport');
-  var fileInput = document.querySelector('#mdFileInput');
-  if (btnImport && fileInput) {
-    btnImport.addEventListener('click', function () { fileInput.click(); });
-    fileInput.addEventListener('change', function () {
-      var file = fileInput.files && fileInput.files[0];
-      if (!file) return;
-      var reader = new FileReader();
-      reader.onload = function (e) {
-        var parsed = parseMdFile(String(e.target.result || ''), file.name);
-        var title = document.querySelector('#titleInput'); if (title) title.value = parsed.title;
-        var date = document.querySelector('#dateInput'); if (date) date.value = parsed.date;
-        var tags = document.querySelector('#tagInput'); if (tags) tags.value = parsed.tags.join(', ');
-        var excerpt = document.querySelector('#excerptInput'); if (excerpt) excerpt.value = parsed.excerpt || '';
-        var md2 = document.querySelector('#mdInput'); if (md2) md2.value = parsed.content;
-        updatePreview();
-      };
-      reader.readAsText(file);
-    });
-  }
-
-  var btnSave = document.querySelector('#btnSave');
-  if (btnSave) btnSave.addEventListener('click', function () { saveStaticArticle(); });
-
-  var btnCloud = document.querySelector('#btnCloud');
-  if (btnCloud) btnCloud.addEventListener('click', function () { cloudPublish(); });
-
-  var btnExport = document.querySelector('#btnExport');
-  if (btnExport) btnExport.addEventListener('click', function () {
-    saveFileFriendly('posts.js', buildPostsJs(), t('export.exported') + ' posts.js', t('export.downloaded') + ' posts.js');
-  });
-
-  var btnRss = document.querySelector('#btnRss');
-  if (btnRss) btnRss.addEventListener('click', function () {
-    saveFileFriendly('feed.xml', buildFeedXmlClient(getStaticPosts(), 20), t('export.exported') + ' feed.xml', t('export.downloaded') + ' feed.xml');
-  });
-
-  var btnSitemap = document.querySelector('#btnSitemap');
-  if (btnSitemap) btnSitemap.addEventListener('click', function () {
-    saveFileFriendly('sitemap.xml', buildSitemapClient(), t('export.exported') + ' sitemap.xml', t('export.downloaded') + ' sitemap.xml');
-  });
-
-  // 一键导出全部：posts.js + feed.xml + sitemap.xml 三件套一次导出（静态发布只需覆盖这三个文件）
-  var btnExportAll = document.querySelector('#btnExportAll');
-  if (btnExportAll) btnExportAll.addEventListener('click', function () {
-    saveFileFriendly('posts.js', buildPostsJs(), t('export.exported') + ' posts.js', t('export.downloaded') + ' posts.js');
-    saveFileFriendly('feed.xml', buildFeedXmlClient(getStaticPosts(), 20), t('export.exported') + ' feed.xml', t('export.downloaded') + ' feed.xml');
-    saveFileFriendly('sitemap.xml', buildSitemapClient(), t('export.exported') + ' sitemap.xml', t('export.downloaded') + ' sitemap.xml');
-  });
-
-  var btnLogout = document.querySelector('#btnLogout');
-  if (btnLogout) btnLogout.addEventListener('click', async function () {
-    await adminLogout();
-    route();
-  });
-
-  // 侧边栏退出按钮
+  // 侧边栏退出按钮（唯一后台独有；其余编辑器按钮与快捷键统一由下方 bindWriteEvents() 绑定，
+  // 避免与 renderWrite 重复 ~100 行绑定逻辑，也杜绝同一按钮被绑定两次导致点击触发双次）
   var btnLogoutSidebar = document.querySelector('#btnLogoutSidebar');
   if (btnLogoutSidebar) btnLogoutSidebar.addEventListener('click', async function () {
     await adminLogout();
     route();
-  });
-
-  document.addEventListener('keydown', function (e) {
-    if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveDraft(); }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); saveStaticArticle(); }
   });
 
   // 文章列表操作按钮（事件委托）：置顶、删除
@@ -2733,7 +3260,7 @@ function buildSitemapClient() {
   var cfg = getConfig();
   var base = cfg.siteUrl || (typeof location !== 'undefined' ? location.origin : '');
   base = String(base || '').replace(/\/+$/, '');
-  var posts = sortPagePosts(getStaticPosts());
+  var posts = sortPagePosts(getPublishedPosts());
   var lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'];
   lines.push('  <url><loc>' + esc(base + '/') + '</loc></url>');
   lines.push('  <url><loc>' + esc(base + '/about') + '</loc></url>');
@@ -2819,22 +3346,12 @@ function serializeQuery(query) {
   var kv = Object.keys(query || {}).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(query[k]); });
   return kv.length ? '?' + kv.join('&') : '';
 }
-/** 旧 hash 里解析查询（编辑文章等），兼容两种情况 */
-function parseQuery(source) {
-  var q = {};
-  var str = String(source != null ? source : (useHashMode() ? location.hash : location.search));
-  var m = str.match(/[?&]([^=]+)=([^&]*)/g);
-  if (m) m.forEach(function (kv) {
-    var p = kv.replace(/^[?&]/, '').split('=');
-    try { q[decodeURIComponent(p[0])] = decodeURIComponent(p[1]); } catch (e) {}
-  });
-  return q;
-}
 
 var _i18nReady = false;
 async function route() {
   _searchOpen = false;   // 进入新页面时收起顶部搜索
   _featuredCache = null; // 清除精选缓存，确保每页重新计算
+  destroySmojiPicker(); // 清理 Smoji 表情选择器
   // 重置 body overflow，防止侧边栏打开时切换语言导致页面无法滚动
   document.body.style.overflow = '';
   // 首次路由时加载语言文件（同步读 localStorage，异步加载 JSON）
@@ -2846,7 +3363,7 @@ async function route() {
   var path = r.path;
   var q = r.query;
 
-  if (path === '/') { app().innerHTML = renderHome(); }
+  if (path === '/') { app().innerHTML = renderHome(); fitCardLineClamps(); }
   else if (path.indexOf('/posts/') === 0) {
     // /posts/<别名>/  或  /posts/<别名>/edit
     var rest = path.slice('/posts/'.length); // 已去尾斜杠
@@ -2888,6 +3405,8 @@ async function route() {
   }
   updateSEO(path);
   bindGlobal();
+  /* 播放器等全站组件监听路由变化（如后台页隐藏播放器） */
+  try { window.dispatchEvent(new CustomEvent('qy:route')); } catch (e) {}
 }
 
 /* ---------- SEO：动态更新 meta 标签 ---------- */
@@ -3022,15 +3541,410 @@ function _setJsonLd(obj) {
 }
 
 
+/* ============================================================
+ * AI 功能（渐进增强，零侵入降级）
+ * · 后端 /api/ai/* 仅在 Cloudflare 绑定 Workers AI 时可用；
+ *   前端探测失败 → 相关 slot 保持为空，不渲染任何 AI 元素。
+ * · 任何 AI 请求失败只影响该元素自身，绝不阻塞博客核心功能。
+ * ============================================================ */
+var _aiOk = null;
+var _aiProbing = false;
+function aiProbe() {
+  if (_aiOk !== null) return Promise.resolve(_aiOk === true);
+  if (_aiProbing) {
+    return new Promise(function (resolve) {
+      var iv = setInterval(function () {
+        if (_aiOk !== null) { clearInterval(iv); resolve(_aiOk === true); }
+      }, 60);
+    });
+  }
+  _aiProbing = true;
+  // sessionStorage 短记忆：可用缓存 10 分钟；不可用只缓存 30 秒
+  // （AI 上线/修复后，用户刷新页面即可恢复，不会被旧「不可用」状态卡住）
+  var saved = null;
+  try { saved = sessionStorage.getItem('qingyu.ai.ok'); } catch (e) {}
+  if (saved) {
+    var parts = String(saved).split('|');
+    var ttl = parts[0] === '1' ? 600000 : 30000;
+    if (parts[1] && (Date.now() - Number(parts[1])) < ttl) {
+      _aiOk = parts[0] === '1';
+      return Promise.resolve(_aiOk === true);
+    }
+  }
+  return apiFetch('api/ai/ping')
+    .then(function () { _aiOk = true; })
+    .catch(function () { _aiOk = false; })
+    .then(function () {
+      try { sessionStorage.setItem('qingyu.ai.ok', (_aiOk ? '1' : '0') + '|' + Date.now()); } catch (e) {}
+      return _aiOk === true;
+    });
+}
+function aiLang() {
+  var loc = (window.__i18n && window.__i18n.getLocale) ? window.__i18n.getLocale() : 'zh-CN';
+  return /^(zh-CN|en|ja|ko|hi)$/.test(loc) ? loc : 'zh-CN';
+}
+function aiErrText(e) {
+  var m = (e && e.message) || '';
+  return /^HTTP \d{3}$/.test(m) ? t('ai.fail') : (m || t('ai.fail'));
+}
+/* —— 渲染时的占位 slot（探测失败保持为空） —— */
+function aiPostSlot(post) {
+  if (!post || post.enc || Number(post.protected || 0) === 1) return '';
+  return '<div class="ai-post-slot" id="aiSummarySlot" data-slug="' + esc(post.id) + '"></div>';
+}
+function aiAssistSlotHTML() {
+  return '<div class="ai-assist-slot" id="aiAssistSlot"></div>';
+}
+function aiCommentsSlotHTML() {
+  return '<div class="ai-comments-slot" id="aiCommentsSlot"></div>';
+}
+/* —— 探测完成后填充 slot —— */
+function aiFillSlots() {
+  aiProbe().then(function (ok) {
+    var s = document.getElementById('aiSummarySlot');
+    if (s) {
+      var slug = s.getAttribute('data-slug') || '';
+      if (ok && slug) {
+        // 优先拉取已有缓存摘要：命中直接展示（刷新不丢），未命中显示生成按钮
+        apiFetch('api/ai/summary?slug=' + encodeURIComponent(slug) + '&lang=' + encodeURIComponent(aiLang()), { method: 'GET' })
+          .then(function (d) {
+            var el = document.getElementById('aiSummarySlot');
+            if (!el) return;
+            if (d && d.summary) {
+              el.innerHTML = aiSummaryCardHTML(d.summary, slug, !!d.cached || adminOk(), !!d.cached);
+            } else {
+              el.innerHTML = aiSummaryBtnHTML(slug);
+            }
+          })
+          .catch(function () {
+            var el = document.getElementById('aiSummarySlot');
+            if (el) el.innerHTML = aiSummaryBtnHTML(slug);
+          });
+      } else {
+        s.innerHTML = '';
+      }
+    }
+    var as = document.getElementById('aiAssistSlot');
+    if (as) as.innerHTML = ok ? aiAssistBarHTML() : '';
+    var cs = document.getElementById('aiCommentsSlot');
+    if (cs) cs.innerHTML = ok ? aiCommentsBarHTML() : '';
+    // 文章卡片摘要：有 AI 摘要（已生成缓存）→ 替换默认摘要在摘要位展示；无 → 保持默认兜底
+    if (ok) aiFillCardExcerpts();
+  });
+}
+/** 卡片摘要 AI 化：遍历带 data-ai-excerpt 的摘要元素，异步拉取该文 AI 摘要并替换；
+ *  没有缓存摘要 / AI 未启用 / 拉取失败 → 保持默认摘要兜底不动。 */
+function aiFillCardExcerpts() {
+  var els = document.querySelectorAll('.post-card .excerpt[data-ai-excerpt]');
+  if (!els.length) return;
+  Array.prototype.forEach.call(els, function (el) {
+    var slug = el.getAttribute('data-ai-excerpt');
+    if (!slug) return;
+    apiFetch('api/ai/summary?slug=' + encodeURIComponent(slug) + '&lang=' + encodeURIComponent(aiLang()), { method: 'GET' })
+      .then(function (d) {
+        if (d && d.summary && el.isConnected) el.textContent = d.summary;
+      })
+      .catch(function () { /* 拉取失败：保留默认摘要 */ });
+  });
+}
+function aiSummaryBtnHTML(slug) {
+  return '<button type="button" class="btn btn-sm btn-ghost ai-btn" data-ai-action="summary" data-slug="' + esc(slug) + '">' + svgIcon('spark', 13) + ' ' + esc(t('ai.title')) + '</button>';
+}
+function aiSummaryCardHTML(summary, slug, isAdmin, cached) {
+  return '<div class="ai-card">'
+    + '<div class="ai-card-head">' + svgIcon('spark', 13) + ' ' + esc(t('ai.title')) + '<span class="ai-badge">' + esc(t(cached ? 'ai.cached' : 'ai.generated')) + '</span></div>'
+    + '<div class="ai-card-body">' + esc(summary) + '</div>'
+    + (isAdmin ? '<div class="ai-card-foot"><button type="button" class="btn btn-sm btn-ghost" data-ai-action="summary" data-slug="' + esc(slug) + '" data-force="1">' + svgIcon('pen', 12) + ' ' + esc(t('ai.regenerate')) + '</button></div>' : '')
+    + '</div>';
+}
+function aiDoSummary(btn) {
+  var slug = btn.getAttribute('data-slug') || '';
+  var force = !!btn.getAttribute('data-force');
+  var slot = document.getElementById('aiSummarySlot');
+  var orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = svgIcon('spinner', 13) + ' ' + esc(t('site.loading'));
+  apiFetch('api/ai/summary', { method: 'POST', body: JSON.stringify({ slug: slug, lang: aiLang(), force: force }) })
+    .then(function (d) {
+      if (slot) slot.innerHTML = aiSummaryCardHTML(d.summary || '', slug, adminOk());
+    })
+    .catch(function (e) {
+      btn.disabled = false;
+      btn.innerHTML = orig;
+      if (slot) {
+        var msg = document.createElement('div');
+        msg.className = 'ai-fail';
+        msg.textContent = aiErrText(e);
+        slot.appendChild(msg);
+        setTimeout(function () { if (msg.parentNode) msg.parentNode.removeChild(msg); }, 6000);
+      }
+    });
+}
+/* —— 后台写作助手 —— */
+function aiAssistBarHTML() {
+  var opts = ['zh-CN', 'en', 'ja', 'ko', 'hi'].map(function (c) {
+    return '<option value="' + c + '"' + (c === aiLang() ? ' selected' : '') + '>' + c + '</option>';
+  }).join('');
+  return '<div class="ai-assist">'
+    + '<span class="ai-assist-title">' + svgIcon('spark', 13) + ' ' + esc(t('ai.assist.title')) + '</span>'
+    + '<select class="ai-assist-lang" id="aiAssistLang" aria-label="' + esc(t('ai.assist.targetLang')) + '">' + opts + '</select>'
+    + '<button type="button" class="btn btn-sm" data-ai-action="title">' + esc(t('ai.assist.titles')) + '</button>'
+    + '<button type="button" class="btn btn-sm" data-ai-action="polish">' + esc(t('ai.assist.polish')) + '</button>'
+    + '<button type="button" class="btn btn-sm" data-ai-action="translate">' + esc(t('ai.assist.translate')) + '</button>'
+    + '<span class="ai-assist-msg" id="aiAssistMsg"></span>'
+    + '<div class="ai-assist-out" id="aiAssistOut"></div>'
+    + '</div>';
+}
+function aiAssistMsg(text) {
+  var el = document.getElementById('aiAssistMsg');
+  if (el) el.textContent = text;
+}
+function aiDoAssist(action, btn) {
+  var md = document.getElementById('mdInput');
+  var text = md ? md.value : '';
+  if (!text || !text.trim()) { aiAssistMsg(t('ai.assist.empty')); return; }
+  var sel = document.getElementById('aiAssistLang');
+  var lang = sel ? sel.value : aiLang();
+  var orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = svgIcon('spinner', 13);
+  apiFetch('api/ai/assist', { method: 'POST', body: JSON.stringify({ action: action, text: text, lang: lang }) })
+    .then(function (d) {
+      btn.disabled = false;
+      btn.innerHTML = orig;
+      aiAssistMsg('');
+      var out = document.getElementById('aiAssistOut');
+      if (out) out.innerHTML = aiAssistResultHTML(action, (d && d.result) || '');
+    })
+    .catch(function (e) {
+      btn.disabled = false;
+      btn.innerHTML = orig;
+      aiAssistMsg(aiErrText(e));
+    });
+}
+function aiAssistResultHTML(action, result) {
+  var apply;
+  if (action === 'title') apply = '<button type="button" class="btn btn-sm btn-primary" data-ai-use="title">' + esc(t('ai.assist.applyTitle')) + '</button>';
+  else if (action === 'tags') apply = '<button type="button" class="btn btn-sm btn-primary" data-ai-use="tags">' + esc(t('ai.assist.applyTags')) + '</button>';
+  else apply = '<button type="button" class="btn btn-sm btn-primary" data-ai-use="paste">' + esc(t('ai.assist.pasteEnd')) + '</button>';
+  return '<div class="ai-result"><pre>' + esc(result) + '</pre><div class="ai-result-actions">'
+    + apply
+    + '<button type="button" class="btn btn-sm btn-ghost" data-ai-use="copy">' + svgIcon('copy', 12) + ' ' + esc(t('ai.assist.copy')) + '</button>'
+    + '<button type="button" class="btn btn-sm btn-ghost" data-ai-use="hide">' + esc(t('ai.assist.hide')) + '</button>'
+    + '</div></div>';
+}
+function aiApplyUse(use) {
+  var out = document.getElementById('aiAssistOut');
+  if (!out) return;
+  var pre = out.querySelector('pre');
+  var text = pre ? pre.textContent : '';
+  if (use === 'hide') { out.innerHTML = ''; return; }
+  if (use === 'copy') {
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(function () {});
+    return;
+  }
+  if (!text) return;
+  if (use === 'title') {
+    var first = String(text).split('\n').map(function (s) { return s.trim(); }).filter(Boolean)[0] || '';
+    var ti = document.getElementById('titleInput');
+    if (ti && first) { ti.value = first; out.innerHTML = ''; }
+  } else if (use === 'tags') {
+    var tg = document.getElementById('tagInput');
+    if (tg) {
+      tg.value = String(text).split(/[\n，,、]/).map(function (s) { return s.trim(); }).filter(Boolean).slice(0, 8).join(', ');
+      out.innerHTML = '';
+    }
+  } else if (use === 'paste') {
+    var md = document.getElementById('mdInput');
+    if (md) {
+      md.value = md.value ? md.value.replace(/\s*$/, '') + '\n\n' + text : text;
+      md.dispatchEvent(new Event('input'));
+      out.innerHTML = '';
+    }
+  }
+}
+/* —— 后台评论 AI —— */
+function aiCommentsBarHTML() {
+  return '<button type="button" class="btn btn-sm" data-ai-action="csummary">' + svgIcon('spark', 14) + ' ' + esc(t('ai.comments.summarize')) + '</button>';
+}
+function aiDoCommentSummary(btn) {
+  var slot = document.getElementById('aiCommentsSlot');
+  var orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = svgIcon('spinner', 13) + ' ' + esc(t('site.loading'));
+  apiFetch('api/ai/comments', { method: 'POST', body: JSON.stringify({ action: 'summarize' }) })
+    .then(function (d) {
+      if (!slot) return;
+      if (d && d.empty) { slot.innerHTML = '<div class="ai-fail info">' + esc(t('ai.comments.empty')) + '</div>'; return; }
+      slot.innerHTML = aiCommentsPanelHTML((d && d.summary) || '', !!(d && d.cached));
+    })
+    .catch(function (e) {
+      btn.disabled = false;
+      btn.innerHTML = orig;
+      if (slot) {
+        var msg = document.createElement('div');
+        msg.className = 'ai-fail';
+        msg.textContent = aiErrText(e);
+        slot.appendChild(msg);
+        setTimeout(function () { if (msg.parentNode) msg.parentNode.removeChild(msg); }, 6000);
+      }
+    });
+}
+function aiCommentsPanelHTML(summary, cached) {
+  return '<div class="ai-card">'
+    + '<div class="ai-card-head">' + svgIcon('spark', 13) + ' ' + esc(t('ai.comments.summary')) + '<span class="ai-badge">' + esc(cached ? t('ai.cached') : t('ai.generated')) + '</span></div>'
+    + '<div class="ai-card-body">' + esc(summary) + '</div>'
+    + '<div class="ai-screen">'
+    + '<textarea id="aiScreenText" rows="2" maxlength="1000" placeholder="' + esc(t('ai.comments.screenHint')) + '"></textarea>'
+    + '<div class="ai-screen-row"><button type="button" class="btn btn-sm" data-ai-action="screen">' + esc(t('ai.comments.screen')) + '</button><span class="ai-screen-out" id="aiScreenOut"></span></div>'
+    + '</div></div>';
+}
+function aiDoScreen() {
+  var ta = document.getElementById('aiScreenText');
+  var text = ta ? ta.value : '';
+  if (!text.trim()) return;
+  var out = document.getElementById('aiScreenOut');
+  if (out) out.innerHTML = '<span class="ai-pending">' + esc(t('site.loading')) + '…</span>';
+  apiFetch('api/ai/comments', { method: 'POST', body: JSON.stringify({ action: 'screen', text: text }) })
+    .then(function (d) {
+      if (out) {
+        out.innerHTML = d && d.spam
+          ? '<span class="ai-screen-spam">' + esc(t('ai.comments.spam')) + (d.reason ? '：' + esc(d.reason) : '') + '</span>'
+          : '<span class="ai-screen-ok">' + esc(t('ai.comments.notSpam')) + (d && d.reason ? '：' + esc(d.reason) : '') + '</span>';
+      }
+    })
+    .catch(function (e) { if (out) out.textContent = aiErrText(e); });
+}
+var _aiBound = false;
+function bindAiEvents() {
+  if (_aiBound) return;
+  _aiBound = true;
+  document.addEventListener('click', function (e) {
+    var t = (e && e.target) || null;
+    if (!t || !t.closest) return;
+    var act = t.closest('[data-ai-action]');
+    if (act) {
+      var action = act.getAttribute('data-ai-action');
+      if (action === 'summary') aiDoSummary(act);
+      else if (action === 'title' || action === 'polish' || action === 'tags' || action === 'translate') aiDoAssist(action, act);
+      else if (action === 'csummary') aiDoCommentSummary(act);
+      else if (action === 'screen') aiDoScreen();
+      return;
+    }
+    var use = t.closest('[data-ai-use]');
+    if (use) { aiApplyUse(use.getAttribute('data-ai-use')); }
+  });
+}
+function aiInit() {
+  bindAiEvents();
+  aiFillSlots();
+}
+
 function bindGlobal() {
   // 主题切换：顶栏
   var tb = document.querySelector('#themeToggle');
   if (tb) tb.addEventListener('click', function () { toggleTheme(); });
+  bindAccentPicker();
   bindTocScroll();
   bindSearch();
   bindBackTop();
   populateLangSwitch();
   bindMobileSidebar();
+  aiInit();
+  bindFitCardLineClamps();   // 手机卡片摘要行数自适应：旋转/字体加载后重测
+  // 广告占位符：有广告（静态内容或 AdSense 已填充）才显示，无广告保持隐藏
+  initAdSlots(app());
+}
+
+/* ---------- 广告占位符显隐 ----------
+ * .ad-slot 框（虚线占位）默认隐藏，避免 AdSense 未返回广告时在文章/列表里留下空虚线框：
+ *  · 内容是静态 HTML（非广告联盟 ins）→ 直接显示
+ *  · 内容是 <ins class="adsbygoogle"> → 轮询等待 AdSense 填充（ins 内出现 iframe/子节点）后显示；
+ *    约 12s 仍未填充（无广告可展示）→ 保持隐藏
+ * 每次路由渲染后（bindGlobal）调用；DOM 被替换时轮询自动终止（isConnected 检查）。 */
+function initAdSlots(scope) {
+  if (!scope || !scope.querySelectorAll) return;
+  Array.prototype.forEach.call(scope.querySelectorAll('.ad-slot'), function (slot) {
+    var ins = slot.querySelector('ins.adsbygoogle');
+    if (!ins) { slot.classList.add('has-ad'); return; }  // 静态广告内容：直接显示
+    ensureAdSenseScheduled(slot);
+    var tries = 0;
+    var timer = setInterval(function () {
+      tries++;
+      var filled = !!(ins.querySelector('iframe') || (ins.children && ins.children.length > 0));
+      if (filled) {
+        clearInterval(timer);
+        slot.classList.add('has-ad');
+      } else if (!slot.isConnected || tries >= 24) {
+        // DOM 已被替换，或 ~12s 未填充（无广告返回）→ 终止，保持隐藏
+        clearInterval(timer);
+      }
+    }, 500);
+  });
+}
+
+/* 主题色「颜色下拉」：桌面顶栏 + 手机侧栏统一形态。
+ * 全部走 document 级事件委托：与顶栏/侧栏的渲染时序解耦——
+ * 若首个进入的页面不含顶栏（后台等），之后回到前台时点击依然有效。 */
+/* 主题色 & 语言（桌面弹层）+ 手机原生下拉的切换。
+ * 全部走 document 级事件委托：与顶栏/侧栏的渲染时序解耦——
+ * 若首个进入的页面不含顶栏（后台等），之后回到前台时点击依然有效。 */
+function ensureBgAnimLoaded(cb) {
+  if (window.bgAnim) { if (cb) cb(); return; }
+  if (document.getElementById('bgAnimLazyLoader')) return;
+  var s = document.createElement('script');
+  s.id = 'bgAnimLazyLoader';
+  s.src = appRoot() + 'bg-anim.min.js?v=' + BLOG_VERSION;
+  s.async = true;
+  s.onload = function () { if (cb) cb(); };
+  s.onerror = function () { try { s.parentNode.removeChild(s); } catch (e) {} };
+  document.head.appendChild(s);
+}
+
+var _accentBound = false;
+function bindAccentPicker() {
+  if (_accentBound) { renderAccentSwatches(); renderAccentNativeSelect(); renderLangPop(); return; }
+  _accentBound = true;
+  document.addEventListener('click', function (e) {
+    var t = (e && e.target) || null;
+    if (!t || !t.closest) return;
+    if (t.closest('#accentToggle')) { toggleAccentPop(); return; }
+    if (t.closest('#langToggle')) { toggleLangPop(); return; }
+    if (t.closest('#bgAnimToggle')) { if (window.bgAnim) { window.bgAnim.toggle(); return; } ensureBgAnimLoaded(function () { if (window.bgAnim) window.bgAnim.toggle(); }); return; }
+    var sw = t.closest('.accent-pop [data-accent]');
+    if (sw) { setAccent(sw.getAttribute('data-accent')); closeAccentPop(); closeLangPop(); return; }
+    var lo = t.closest('.lang-pop [data-lang]');
+    if (lo) {
+      closeLangPop();
+      if (window.__i18n && window.__i18n.loadLocale) {
+        window.__i18n.loadLocale(lo.getAttribute('data-lang')).then(function () { route(); });
+      }
+      return;
+    }
+    // 点击任意弹层外部：关闭
+    var wrap = document.getElementById('accentWrap');
+    if (wrap && wrap.contains && !wrap.contains(t)) closeAccentPop();
+    var lwrap = document.getElementById('langWrap');
+    if (lwrap && lwrap.contains && !lwrap.contains(t)) closeLangPop();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (!e || e.key !== 'Escape') return;
+    closeAccentPop();
+    closeLangPop();
+  });
+  // 背景动画开关状态变化：即时刷新顶栏按钮（无需整页重渲染）
+  document.addEventListener('qingyu:bgAnim', function () {
+    var on = !!(window.bgAnim && window.bgAnim.isOn());
+    var b = document.getElementById('bgAnimToggle');
+    if (b) {
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.title = on ? t('bgAnim.on') : t('bgAnim.off');
+      b.setAttribute('aria-label', t('bgAnim.title'));
+    }
+  });
+  renderAccentSwatches();
+  renderAccentNativeSelect();
+  renderLangPop();
 }
 
 function bindMobileSidebar() {
@@ -3072,7 +3986,7 @@ function bindMobileSidebar() {
 }
 
 function populateLangSwitch() {
-  var sels = document.querySelectorAll('.lang-switch');
+  var sels = document.querySelectorAll('.lang-switch:not(.accent-native)');
   if (!sels.length || !window.__i18n || typeof window.__i18n.getLanguages !== 'function') return;
   var langs = window.__i18n.getLanguages();
   var current = window.__i18n.getLocale ? window.__i18n.getLocale() : 'zh-CN';
@@ -3081,21 +3995,35 @@ function populateLangSwitch() {
     langs.forEach(function (lang) {
       var opt = document.createElement('option');
       opt.value = lang.code;
-      opt.textContent = lang.flag + ' ' + lang.name;
+      opt.textContent = compactLangFlag(lang) ? compactLangFlag(lang) + ' ' + lang.name : lang.name;
       if (lang.code === current) opt.selected = true;
       sel.appendChild(opt);
     });
   });
 }
 
-/* 返回顶部悬浮按钮：滚动超过一屏出现，点击平滑滚回当前页顶部（不跳转页面） */
+/* 返回顶部悬浮按钮：滚动超过一屏出现，点击平滑滚回当前页顶部（不跳转页面）
+   缓存按钮元素 + rAF 合帧，减少滚动时的查询与强制布局 */
 var _backTopScrollBound = false;
+var _backTopEl = null;
+var _backTopRafPending = false;
 function bindBackTop() {
   if (!_backTopScrollBound && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
     _backTopScrollBound = true;
-    window.addEventListener('scroll', function () { updateBackTop(); }, { passive: true });
+    if (!_backTopEl) _backTopEl = document.querySelector('#backTop');
+    window.addEventListener('scroll', function () {
+      if (_backTopRafPending) return;
+      _backTopRafPending = true;
+      if (typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(function () { _backTopRafPending = false; updateBackTop(); });
+      } else {
+        _backTopRafPending = false;
+        updateBackTop();
+      }
+    }, { passive: true });
   }
-  var bt = document.querySelector('#backTop');
+  if (!_backTopEl) _backTopEl = document.querySelector('#backTop');
+  var bt = _backTopEl;
   if (bt && bt.addEventListener) bt.addEventListener('click', function () {
     if (typeof window.scrollTo === 'function') {
       try { window.scrollTo({ top: 0, behavior: 'smooth' }); }
@@ -3105,11 +4033,19 @@ function bindBackTop() {
   updateBackTop();
 }
 function updateBackTop() {
-  var bt = document.querySelector('#backTop');
-  if (!bt || !bt.classList || !bt.classList.add) return;
+  var bt = _backTopEl || document.querySelector('#backTop');
   var y = (typeof window !== 'undefined' && typeof window.scrollY === 'number')
     ? window.scrollY
-    : ((typeof document !== 'undefined' && document.documentElement && document.documentElement.scrollTop) || 0);
+    : ((typeof window !== 'undefined' && typeof window.pageYOffset === 'number') ? window.pageYOffset : 0);
+  // 顶栏滚动阴影：页面下滚后给 body 打 .scrolled（style.css 据此加强顶栏投影）。
+  // 与回到顶部按钮共用同一个 rAF 节流的 scroll 处理器，不额外增加监听。
+  try {
+    var b = document.body;
+    if (b && b.classList) {
+      if (y > 8) b.classList.add('scrolled'); else b.classList.remove('scrolled');
+    }
+  } catch (e) { /* ignore */ }
+  if (!bt || !bt.classList || !bt.classList.add) return;
   if (y > 300) bt.classList.add('show'); else bt.classList.remove('show');
 }
 
@@ -3252,6 +4188,49 @@ function renderSearchPanel(query) {
   panel.classList.add('open');
 }
 
+/* AdSense 延迟加载：仅在广告位进入视口后才注入广告库，不与首屏渲染/API 抢带宽。
+ * 策略：广告位进入视口（提前 150px 预判）后，最早 2.5s、空闲时 3.5s、兜底 5s 才开始加载广告；
+ * 用户没有滚动到广告位时，不加载任何第三方广告脚本。
+ * 广告位已有显隐控制，晚加载不影响布局 */
+var _adSenseScheduled = false;
+var _adSenseObserver = null;
+// 仅当页面中真实出现 AdSense 广告位时才安排加载，首页/无广告页完全不引入第三方脚本。
+function ensureAdSenseScheduled(slot) {
+  if (_adSenseScheduled) return;
+  if (!slot || !('IntersectionObserver' in window)) {
+    // 不支持 IntersectionObserver：退回原有延迟加载
+    _adSenseScheduled = true;
+    scheduleAdSense();
+    return;
+  }
+  if (!_adSenseObserver) {
+    _adSenseObserver = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        _adSenseScheduled = true;
+        _adSenseObserver.disconnect();
+        _adSenseObserver = null;
+        scheduleAdSense();
+      });
+    }, { rootMargin: '150px 0px' });
+  }
+  _adSenseObserver.observe(slot);
+}
+function scheduleAdSense() {
+  var start = Date.now();
+  var fired = false;
+  var fire = function () { if (fired) return; fired = true; loadAdSense(); };
+  var after = function (ms) { return function () { if (Date.now() - start >= ms) fire(); }; };
+  // 空闲即触发，但最短等待 2.5s（保证首屏/API 优先）
+  if (window.requestIdleCallback) {
+    window.requestIdleCallback(after(2500), { timeout: 3500 });
+  } else {
+    setTimeout(after(2500), 3500);
+  }
+  // 兜底：最多 5s 一定开始加载广告
+  setTimeout(fire, 5000);
+}
+
 /* ---------- 广告（AdSense）----------
  * 仅在 ads.enabled && ads.client 时加载官方库脚本（adsbygoogle.js），
  * 注入到 <head>，等价于在 <head> 中放置 AdSense 提供的脚本。
@@ -3272,6 +4251,29 @@ function loadAdSense() {
   } catch (e) { /* 忽略：广告加载失败不影响站点 */ }
 }
 
+/* 等待全局样式表加载完成：style.min.css 已由 render-blocking 改为非阻塞加载，
+ * 但首次渲染的 DOM 仍需要它，因此 route() 前先等待，避免未样式闪烁（FOUC）。
+ * 如果样式迟迟未完成（弱网/异常），最多 4s 后继续渲染，避免永久停在加载态。 */
+function _waitGlobalStyle() {
+  var link = document.getElementById('global-style');
+  if (!link) return Promise.resolve();
+  // 非浏览器环境（测试桩/无 HTMLLinkElement 语义）直接放行，避免无谓等待
+  if (typeof link.media === 'undefined' || typeof link.sheet === 'undefined') return Promise.resolve();
+  try {
+    if (link.media === 'all' && link.sheet && link.sheet.cssRules && link.sheet.cssRules.length) return Promise.resolve();
+  } catch (e) {}
+  return new Promise(function (resolve) {
+    var done = false;
+    var finish = function () { if (done) return; done = true; if (timer) clearInterval(timer); if (fallback) clearTimeout(fallback); resolve(); };
+    var timer = setInterval(function () {
+      try { if (link.media === 'all' && link.sheet && link.sheet.cssRules && link.sheet.cssRules.length) finish(); } catch (e) {}
+    }, 50);
+    var fallback = setTimeout(finish, 4000);
+    link.addEventListener('load', finish);
+    link.addEventListener('error', finish);
+  });
+}
+
 /* ---------- 启动引导 ----------
  * 首屏渲染不等待网络：先用静态/本地数据立即渲染，云端探测（/api/posts）
  * 异步完成后再合并数据并重渲染一次，切换为云端模式 UI。
@@ -3279,53 +4281,72 @@ function loadAdSense() {
 window.__bootPromise = (async function () {
   var cfg = getConfig();
   applyTheme(getTheme());
+  applyAccent(getAccent());
   bindNavClicks();
-  loadAdSense();   // 尽早把 AdSense 库挂到 head，使其能在页面渲染后即时处理广告位
-
+  // 全局样式非阻塞加载后，首帧渲染前需等它就绪（与 i18n 并行），避免 FOUC
+  var _cssReady = _waitGlobalStyle();
   // 确保 i18n 翻译数据在首次渲染前加载完成
   if (window.__i18n && window.__i18n.loadLocale && !window.__i18n.isReady()) {
     await window.__i18n.loadLocale(window.__i18n.getLocale());
     _i18nReady = true;
   }
 
+  await _cssReady;
   route();
   window.addEventListener('hashchange', function () { route(); });
   window.addEventListener('popstate', function () { route(); });
 
   if (cfg.mode === 'api' || cfg.mode === 'auto') {
+    // 首次渲染（上方 route()）会显示加载动画；探测完成（成功或失败）后置位并重渲染，
+    // 否则首页会一直停在「正在拉取文章…」
+    // posts 与 settings 并行拉取：串行叠加等待（各约 0.5~1.5s 冷启动）会拖慢首屏。
+    var results = await Promise.all([
+      apiFetch('api/posts').then(function (r) { return { ok: true, data: r }; }, function () { return { ok: false, data: null }; }),
+      apiFetch('api/settings').then(function (r) { return { ok: true, data: r }; }, function () { return { ok: false, data: null }; })
+    ]);
+    var resp = results[0].ok ? results[0].data : null;
+    var sResp = results[1].ok ? results[1].data : null;
+
     try {
-      var resp = await apiFetch('api/posts');
       var data = resp || {};
       if (data && Array.isArray(data.posts)) {
         var wasCloud = _cloudDetected;
         _cloudDetected = true;   // 云端在线：后续登录用 /api/admin/*
-        if (data.posts.length) {
-          var existing = (Array.isArray(window.BLOG_POSTS) ? window.BLOG_POSTS : []);
-          var byId = {};
-          existing.forEach(function (p) { byId[p.id] = p; });
-          data.posts.forEach(function (p) {
-            var old = byId[p.id];
-            if (old) {
-              // 云端列表是摘要（不含 content/enc）：仅覆盖已返回字段，保留静态正文与摘要，
-              // 避免首页卡片摘要被清空、全文搜索失效
-              var merged = {};
-              Object.keys(p).forEach(function (k) { if (p[k] !== undefined) merged[k] = p[k]; });
-              byId[p.id] = Object.assign({}, old, merged);
-            } else {
-              byId[p.id] = p;
-            }
-          });
-          window.BLOG_POSTS = Object.keys(byId).map(function (k) { return byId[k]; });
-        }
-        // 探测成功：模式或数据有变化则重渲染一次（切换云端 UI、刷新列表数据）
+        _cloudReady = true;
+        // 合并云端列表与本地静态列表：云端摘要覆盖已返回字段，保留静态正文与摘要
+        // （content/enc 等）；未在云端列表中的静态文章仍保留作兜底。
+        // 已删除文章的兜底隐患由 renderPost 的 404 处理兜底：访问时即移除并显示不存在。
+        var existing = (Array.isArray(window.BLOG_POSTS) ? window.BLOG_POSTS : []);
+        var byId = {};
+        existing.forEach(function (p) { byId[p.id] = p; });
+        data.posts.forEach(function (p) {
+          var old = byId[p.id];
+          if (old) {
+            // 云端列表是摘要（不含 content/enc）：仅覆盖已返回字段，保留静态正文与摘要，
+            // 避免首页卡片摘要被清空、全文搜索失效
+            var merged = {};
+            Object.keys(p).forEach(function (k) { if (p[k] !== undefined) merged[k] = p[k]; });
+            byId[p.id] = Object.assign({}, old, merged);
+          } else {
+            byId[p.id] = p;
+          }
+        });
+        window.BLOG_POSTS = Object.keys(byId).map(function (k) { return byId[k]; });
+        // 探测成功：模式或数据有变化则重渲染一次（切换云端 UI、刷新列表数据；
+        // 0 篇也用 !wasCloud 重渲染 → 从加载动画变为「你还未发布文章」空态）
         if (!wasCloud || data.posts.length) route();
+      } else {
+        _cloudReady = true;
       }
-    } catch (e) { /* 超时/失败 → 保持静态模式 */ }
+    } catch (e) {
+      // 超时/失败 → 保持静态模式；置位 ready 并重渲染，避免首页卡在加载动画
+      _cloudReady = true;
+      route();
+    }
 
     // 拉取站点设置（导航菜单 / 站点信息 / 个人资料），合并进运行时配置并重渲染一次。
-    // GET /api/settings 为公开接口；失败时保持静态配置，不影响站点运行。
+    // GET /api/settings 为公开接口；已与 posts 并行拉取（sResp），失败时保持静态配置。
     try {
-      var sResp = await apiFetch('api/settings');
       if (sResp && sResp.settings) {
         var firstLoad = !_siteSettings;
         _siteSettings = sResp.settings;

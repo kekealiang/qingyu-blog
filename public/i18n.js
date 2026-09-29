@@ -18,6 +18,8 @@
   ];
 
   var DEFAULT_LANG = 'zh-CN';
+  /* 语言 JSON 缓存版本：修改 locales/*.json 后递增，强制浏览器拉新文件 */
+  var I18N_VER = '9';
   var _locale = DEFAULT_LANG;
   var _translations = {};
 
@@ -34,11 +36,39 @@
     "nav.admin": "后台",
     "nav.toggle": "展开导航",
     "theme.toggle": "切换深色/浅色模式",
+    "theme.accent": "主题色",
+    "ai.title": "AI 摘要",
+    "ai.generated": "AI 生成 · 仅供参考",
+    "ai.regenerate": "重新生成",
+    "ai.fail": "AI 暂不可用，请稍后再试",
+    "ai.cached": "缓存",
+    "ai.assist.title": "AI 写作助手",
+    "ai.assist.targetLang": "目标语言",
+    "ai.assist.titles": "标题建议",
+    "ai.assist.polish": "润色",
+    "ai.assist.tags": "标签",
+    "ai.assist.translate": "翻译",
+    "ai.assist.empty": "请先在编辑区输入内容",
+    "ai.assist.applyTitle": "应用到标题",
+    "ai.assist.applyTags": "填入标签",
+    "ai.assist.pasteEnd": "插入到正文末尾",
+    "ai.assist.replaceBody": "替换原文",
+    "ai.assist.copy": "复制",
+    "ai.assist.hide": "收起",
+    "ai.comments.summarize": "AI 评论汇总",
+    "ai.comments.summary": "评论汇总",
+    "ai.comments.empty": "暂无评论可汇总",
+    "ai.comments.screenHint": "粘贴一条评论，检测是否垃圾",
+    "ai.comments.screen": "垃圾检测",
+    "ai.comments.spam": "疑似垃圾",
+    "ai.comments.notSpam": "非垃圾",
     "search.toggle": "搜索文章",
     "search.placeholder": "搜索文章…",
     "search.close": "关闭搜索",
     "home.latest": "最新发布",
     "home.noPosts": "这里还没有文章。",
+    "home.loadingCloud": "正在拉取文章…",
+    "home.noPostsCloud": "你还未发布文章",
     "home.loadFail": "加载文章列表失败",
     "home.categoryLabel": "标签",
     "featured.title": "精选文章",
@@ -51,6 +81,17 @@
     "about.title": "关于",
     "about.desc": "一个零依赖、双击即开的轻量博客",
     "about.posts": "篇内容",
+    "player.none": "未播放",
+    "player.playlist": "播放列表",
+    "player.empty": "暂无音乐",
+    "player.volume": "音量",
+    "player.play": "播放",
+    "player.pause": "暂停",
+    "player.prev": "上一首",
+    "player.next": "下一首",
+    "player.seek": "播放进度",
+    "player.close": "关闭",
+    "player.unknown": "未知曲目",
     "about.tags": "个标签",
     "about.totalWords": "总字数",
     "about.latestUpdate": "最新更新",
@@ -166,6 +207,14 @@
     "admin.logging": "登录中…",
     "admin.wrongPwd": "密码错误",
     "admin.defaultPwdHint": "默认密码：",
+    "admin.cloudSetupHint": "首次部署：请使用安装密钥（环境变量 BLOG_ADMIN_SETUP_KEY）设置管理员密码",
+    "admin.setupKeyLabel": "安装密钥",
+    "admin.gotoCloudSetup": "首次部署？使用安装密钥初始化",
+    "admin.backToLogin": "← 返回登录",
+    "admin.breakGlassLink": "被限流？用安装密钥登录",
+    "admin.breakGlassKeyLabel": "安装密钥（X-Setup-Key）",
+    "admin.breakGlassHint": "填入安装密钥可立即跳过登录限流（仍需密码正确）",
+    "admin.gateThrottled": "尝试次数过多，已展开「安装密钥」入口",
     "admin.firstLoginTitle": "欢迎，首次登录",
     "admin.firstLoginDesc": "系统已为你生成随机默认密码，请在修改前记下或复制它：",
     "admin.copyPwd": "复制密码",
@@ -186,7 +235,6 @@
     "admin.sidebar.postManage": "文章管理",
     "admin.sidebar.allPosts": "全部文章",
     "admin.sidebar.writeNew": "写新文章",
-    "admin.sidebar.catManage": "分类管理",
     "admin.sidebar.tagManage": "标签管理",
     "admin.sidebar.commentManage": "评论管理",
     "admin.sidebar.allComments": "全部评论",
@@ -195,6 +243,7 @@
     "admin.sidebar.media": "媒体资源",
     "admin.sidebar.settings": "博客设置",
     "admin.sidebar.admin": "管理员",
+    "admin.sider.hint": "管理后台",
     "admin.sidebar.adminDesc": "个人博客管理员",
     "admin.sidebar.logout": "退出登录",
     "admin.header.toggleMenu": "展开/折叠菜单",
@@ -219,7 +268,6 @@
     "admin.dashboard.totalComments": "评论总数",
     "admin.dashboard.pendingComments": "待审核评论",
     "admin.dashboard.noTitle": "(无标题)",
-    "admin.dashboard.uncategorized": "未分类",
     "admin.dashboard.anonymous": "匿名",
     "admin.dashboard.noPosts": "还没有文章",
     "admin.dashboard.goWrite": "去写一篇",
@@ -235,9 +283,7 @@
     "admin.postList.desc": "管理你已发布与草稿中的文章",
     "admin.postList.search": "搜索标题 / 标签…",
     "admin.postList.allStatus": "全部状态",
-    "admin.postList.allCats": "全部分类",
     "admin.postList.colTitle": "标题",
-    "admin.postList.colCategory": "分类",
     "admin.postList.colTags": "标签",
     "admin.postList.colDate": "发布时间",
     "admin.postList.colStatus": "状态",
@@ -268,8 +314,6 @@
     "admin.editor.newPost": "写新文章",
     "admin.editor.editPost": "编辑文章",
     "admin.editor.titlePlaceholder": "文章标题",
-    "admin.editor.categoryPlaceholder": "分类",
-    "admin.editor.categoryExample": "如：技术",
     "admin.editor.tagsPlaceholder": "标签（逗号分隔）",
     "admin.editor.tagsExample": "如：前端",
     "admin.editor.coverPlaceholder": "封面图 URL（可选）",
@@ -312,16 +356,8 @@
     "admin.comments.deleteConfirm": "确定删除这条评论？",
     "admin.comments.deleted": "已删除",
     "admin.comments.approvedOk": "已通过",
-    "admin.categories.title": "分类管理",
-    "admin.categories.desc": "分类是对文章的归类（每篇文章一个分类），在编辑器中设置。可重命名 / 删除。",
     "admin.categories.staticHint": "静态模式只读",
-    "admin.categories.colCategory": "分类",
     "admin.categories.colCount": "文章数",
-    "admin.categories.noData": "暂无分类",
-    "admin.categories.rename": "重命名",
-    "admin.categories.delete": "删除",
-    "admin.categories.renameOk": "已重命名",
-    "admin.categories.deleteConfirm": "将「{name}」从所有文章中移除，确定？",
     "admin.tags.title": "标签管理",
     "admin.tags.desc": "标签是文章的关键词标记（每篇文章可多个），在编辑器中设置。可重命名 / 删除。",
     "admin.tags.colTag": "标签",
@@ -332,7 +368,7 @@
     "admin.tags.renameOk": "已重命名",
     "admin.tags.deleteConfirm": "删除标签「{name}」，确定？",
     "admin.media.title": "媒体资源",
-    "admin.media.desc": "上传与管理图片（云端存储于 D1，单张建议 ≤ 2MB）",
+    "admin.media.desc": "上传与管理图片（R2 直传云端存储，单张建议 ≤ 10MB）",
     "admin.media.upload": "上传图片",
     "admin.media.cloudOnly": "媒体库需在云端模式（Cloudflare）下使用",
     "admin.media.colImage": "图片",
@@ -343,10 +379,11 @@
     "admin.media.deleteConfirm": "确定从媒体库删除该图片？",
     "admin.media.deleted": "已删除",
     "admin.media.notImage": "不是图片",
-    "admin.media.tooLarge": "超过 2MB",
+    "admin.media.tooLarge": "超过 10MB",
     "admin.media.uploaded": "已上传",
     "admin.media.uploadFail": "上传失败：",
     "admin.media.readFail": "读取失败",
+    "admin.media.r2Missing": "R2 存储未配置，无法上传",
     "admin.settings.title": "博客设置",
     "admin.settings.desc": "站点信息、个人资料",
     "admin.settings.save": "保存设置",
@@ -396,20 +433,112 @@
     "ad.label": "广告",
     "search.noMatch": "没有匹配的文章",
     "export.exported": "已导出",
-    "export.downloaded": "已下载"
+    "export.downloaded": "已下载",
+    "nav.guestbook": "留言板",
+    "bgAnim.title": "背景动画",
+    "bgAnim.on": "背景动画已开启（点击关闭）",
+    "bgAnim.off": "背景动画已关闭（点击开启）",
+    "post.retry": "重试",
+    "comment.emoji": "表情",
+    "admin.sidebar.musicManage": "音乐管理",
+    "admin.dashboard.visitCount": "访问",
+    "admin.dashboard.commentCount": "评论",
+    "admin.postList.deleteNeedExport": "该文章来自内置数据：请「导出 posts.js」覆盖站点文件后，删除才对访客生效",
+    "admin.editor.titleLabel": "文章标题",
+    "admin.editor.titleHint": "为文章起一个清晰易读的标题，将显示在列表、RSS 与浏览器标签中",
+    "admin.editor.emoji": "表情",
+    "admin.media.copy": "复制",
+    "admin.music.title": "音乐管理",
+    "admin.music.desc": "上传与管理博客音乐播放器曲目（音频直传 Cloudflare R2）",
+    "admin.music.cloudOnly": "音乐管理需在云端模式的 Cloudflare 环境下使用",
+    "admin.music.upload": "上传音乐",
+    "admin.music.uploading": "上传中…",
+    "admin.music.uploadOk": "上传成功",
+    "admin.music.uploadFail": "上传失败",
+    "admin.music.putFail": "上传到 R2 失败",
+    "admin.music.chooseFile": "选择音频文件",
+    "admin.music.dropHint": "拖拽音频文件到此处上传，或点击选择文件；文件名按「歌曲名-歌手」自动识别填写",
+    "admin.music.r2Hint": "音频直传 Cloudflare R2（预签名上传，不经服务端中转）",
+    "admin.music.r2Missing": "服务端未配置 R2 公开读取域名（R2_PUBLIC_BASE），请先在 Cloudflare 控制台绑定自定义域名",
+    "admin.music.titlePh": "歌曲名",
+    "admin.music.artistPh": "歌手",
+    "admin.music.colTitle": "曲目",
+    "admin.music.colSize": "大小",
+    "admin.music.colActions": "操作",
+    "admin.music.edit": "编辑",
+    "admin.music.delete": "删除",
+    "admin.music.deleteConfirm": "确定删除该曲目？",
+    "admin.music.deleted": "已删除",
+    "admin.music.empty": "暂无音乐，上传一首开始播放吧",
+    "admin.settings.cloudOnly": "站点设置需在云端模式（Cloudflare）下使用",
+    "admin.settings.navMenu": "导航菜单",
+    "admin.settings.footerNav": "底部导航",
+    "admin.settings.footerNavHint": "可视化编辑底部导航：修改文字与链接，会自动暂存，切换页面也不丢失。",
+    "admin.settings.friendLinks": "友情链接",
+    "admin.settings.friendLinksHint": "管理页脚展示的友情链接，修改文字与链接后保存即可生效。",
+    "admin.settings.linkText": "文字",
+    "admin.settings.linkUrl": "链接",
+    "admin.settings.linkAdd": "添加链接",
+    "admin.settings.linkEmpty": "暂无链接，点击下方按钮添加。",
+    "admin.settings.about": "关于页面内容",
+    "admin.settings.aboutHint": "支持 Markdown，显示在关于页面正文之上",
+    "admin.settings.aboutPlaceholder": "编写关于页面的内容（支持 Markdown）…",
+    "admin.settings.defaultHome": "首页",
+    "admin.settings.defaultArchive": "归档",
+    "admin.settings.defaultAbout": "关于",
+    "admin.settings.defaultFriends": "友链",
+    "admin.settings.visualEditor": "导航菜单",
+    "admin.settings.navVisualHint": "可视化编辑导航菜单：修改文字与链接，可添加子菜单，编辑会自动暂存，切换页面也不丢失。",
+    "admin.settings.navEmpty": "暂无导航项，点击下方按钮添加菜单。",
+    "admin.settings.newMenu": "新菜单",
+    "admin.settings.subMenu": "子菜单",
+    "admin.settings.addMenuItem": "添加菜单项",
+    "admin.settings.resetDefault": "重置为默认导航",
+    "toast.encryptedCloud": "已加密（云端已更新）",
+    "toast.decryptedCloud": "已取消加密（云端已更新）",
+    "toast.encryptedLocal": "已加密：请用下载的 posts.js 覆盖站点文件",
+    "toast.decryptedLocal": "已取消加密：请用下载的 posts.js 覆盖站点文件",
+    "guestbook.title": "留言板",
+    "guestbook.desc": "欢迎留言，或为项目提出优化方案。",
+    "guestbook.noteTab": "留言",
+    "guestbook.ideaTab": "项目优化方案",
+    "guestbook.authorPlaceholder": "昵称",
+    "guestbook.contentPlaceholder": "写下你的留言或优化建议…",
+    "guestbook.noteKind": "留言",
+    "guestbook.ideaKind": "优化方案",
+    "guestbook.empty": "还没有留言，来抢沙发吧～",
+    "guestbook.posting": "提交中…",
+    "guestbook.posted": "✓ 已发表",
+    "guestbook.fail": "发表失败，请稍后再试",
+    "guestbook.fillBoth": "请填写昵称和内容",
+    "guestbook.postAnon": "发布",
+    "guestbook.emoji": "表情",
+    "guestbook.noteTag": "留言",
+    "guestbook.ideaTag": "优化方案",
+    "admin.postSaved": "文章已保存",
+    "admin.pwdModal.title": "修改密码",
+    "admin.pwdModal.confirmPwd": "当前密码",
+    "admin.pwdModal.newPwd": "新密码",
+    "admin.pwdModal.change": "确认修改",
+    "admin.pwdModal.tooShort": "新密码至少 6 位",
+    "admin.pwdModal.success": "密码已修改",
+    "admin.pwdModal.fail": "修改失败：",
   };
 
   /**
    * 确定 locale JSON 的基础路径。
    * 策略：从 <base href> 或当前脚本 src 推断，确保在子页面也能正确加载。
+   * 结果惰性缓存：base/script src 在页面生命周期内不变，避免每次语言切换重复扫描 DOM。
    */
+  var _baseDirCache = null;
   function _baseDir() {
+    if (_baseDirCache) return _baseDirCache;
     // 优先使用 <base href>
     try {
       var base = document.querySelector('base');
       if (base && base.href) {
         var u = new URL(base.href, location.href);
-        return u.href.replace(/\/+$/, '');
+        return (_baseDirCache = u.href.replace(/\/+$/, ''));
       }
     } catch (e) {}
     // 回退：从 i18n.js 自身的 src 推断（如 /i18n.js → ''）
@@ -419,12 +548,12 @@
         var src = scripts[i].getAttribute('src') || '';
         if (/i18n\.js$/.test(src)) {
           var url = new URL(src, location.href);
-          return url.href.replace(/\/[^\/]*$/, '');
+          return (_baseDirCache = url.href.replace(/\/[^\/]*$/, ''));
         }
       }
     } catch (e) {}
     // 最终回退
-    return location.origin || '';
+    return (_baseDirCache = location.origin || '');
   }
 
   /** 检测浏览器首选语言 → 映射到支持的语言 */
@@ -448,9 +577,9 @@
     // 先加载内嵌兜底（中文即时可用，其他语言空对象）
     _translations = (lang === DEFAULT_LANG) ? JSON.parse(JSON.stringify(_BUILTIN_ZH)) : {};
 
-    // 尝试网络加载最新 JSON 并覆盖
+    // 尝试网络加载最新 JSON 并覆盖（带版本参数，避免旧 JSON 被浏览器/CDN 缓存导致新增 key 缺失）
     var base = _baseDir();
-    var url = base + '/locales/' + lang + '.json';
+    var url = base + '/locales/' + lang + '.json?v=' + I18N_VER;
     var loaded = false;
     try {
       var resp = await fetch(url);
@@ -482,12 +611,15 @@
   }
 
   /** 翻译函数：t('key') 或 t('key', { var: value }) */
+  var _varReCache = {};
   function t(key, vars) {
     var str = _translations[key];
     if (str === undefined || str === null) str = key;
     if (vars && typeof str === 'string') {
       Object.keys(vars).forEach(function (k) {
-        str = str.replace(new RegExp('\\{' + k + '\\}', 'g'), vars[k]);
+        // 缓存已编译的正则，避免列表渲染/弹窗等场景反复构造
+        var re = _varReCache[k] || (_varReCache[k] = new RegExp('\\{' + k + '\\}', 'g'));
+        str = str.replace(re, vars[k]);
       });
     }
     return str;
@@ -520,3 +652,4 @@
   // 兼容别名
   window.t = t;
 })();
+

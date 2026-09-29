@@ -6,7 +6,13 @@
  *   · 其余请求 → 静态资源（由 wrangler.workers.toml [assets] 绑定提供）
  * 部署：npx wrangler deploy
  * ============================================================ */
-import { handlePosts, handlePostId, handleFeed, handleComments, handleCommentId, handleSitemap, handleSiteFiles, handleStats, handleAdminSetup, handleAdminLogin, handleAdminLogout, getCorsHeaders, handleCommentsList, handleCommentUpdate, handleCommentDeleteGlobal, handleMedia, handleMediaId, handleSettings, handleAdminPassword, handleStatsTrend } from './functions/_lib/api-core.js';
+import { handlePosts, handlePostId, handleFeed, handleComments, handleCommentId, handleSitemap, handleSiteFiles, handleStats, handleAdminSetup, handleAdminLogin, handleAdminLogout, getCorsHeaders, securityHeaders, handleCommentsList, handleCommentUpdate, handleCommentDeleteGlobal, handleMedia, handleMediaId, handleSettings, handleAdminPassword, handleStatsTrend, dbFirst } from './functions/_lib/api-core.js';
+import { onRequest as aiPing } from './functions/api/ai/ping.js';
+import { onRequest as aiSummary } from './functions/api/ai/summary.js';
+import { onRequest as aiAssist } from './functions/api/ai/assist.js';
+import { onRequest as aiComments } from './functions/api/ai/comments.js';
+import { handleMusic, handleMusicId, handleMusicUploadUrl } from './functions/_lib/music.js';
+import { handleMediaUploadUrl, deleteMediaObject } from './functions/_lib/media.js';
 
 export default {
   async fetch(request, env) {
@@ -24,7 +30,8 @@ export default {
         status: 500,
         headers: Object.assign(
           { 'Content-Type': 'application/json; charset=utf-8' },
-          getCorsHeaders(request, env)
+          getCorsHeaders(request, env),
+          securityHeaders()
         )
       });
     }
@@ -55,6 +62,9 @@ export default {
     if (url.pathname === '/api/media') {
       return handleMedia(request, env);
     }
+    if (url.pathname === '/api/media/upload-url') {
+      return handleMediaUploadUrl(request, env);
+    }
     if (url.pathname === '/api/settings') {
       return handleSettings(request, env);
     }
@@ -68,13 +78,25 @@ export default {
     }
     let mm = url.pathname.match(/^\/api\/media\/([^/]+)$/);
     if (mm) {
-      return handleMediaId(request, env, decodeURIComponent(mm[1]));
+      const mid = decodeURIComponent(mm[1]);
+      // 删除媒体：先删 R2 对象（若 url 是本站 media/ 前缀），再删 D1 元数据
+      if (request.method === 'DELETE') {
+        const row = env && env.DB ? await dbFirst(env.DB, 'SELECT url FROM media WHERE id = ?', mid).catch(() => null) : null;
+        if (row && row.url) { try { await deleteMediaObject(env, row.url); } catch (e) { /* R2 删除失败不阻塞 */ } }
+      }
+      return handleMediaId(request, env, mid);
     }
     if (url.pathname === '/api/feed.xml') {
       return handleFeed(request, env);
     }
     if (url.pathname === '/api/sitemap.xml') {
       return handleSitemap(request, env);
+    }
+    if (url.pathname === '/sitemap.xml') {
+      return handleSitemap(request, env);
+    }
+    if (url.pathname === '/feed.xml') {
+      return handleFeed(request, env);
     }
     let match = url.pathname.match(/^\/api\/posts\/([^/]+)\/comments\/([^/]+)$/);
     if (match) {
@@ -99,27 +121,71 @@ export default {
     if (url.pathname === '/api/site-files') {
       return handleSiteFiles(request, env);
     }
+    // AI（Workers AI；未绑定/关闭时由 ai lib 返回 404，前端自动隐藏）
+    if (url.pathname === '/api/ai/ping') {
+      return aiPing({ request, env });
+    }
+    if (url.pathname === '/api/ai/summary') {
+      return aiSummary({ request, env });
+    }
+    if (url.pathname === '/api/ai/assist') {
+      return aiAssist({ request, env });
+    }
+    if (url.pathname === '/api/ai/comments') {
+      return aiComments({ request, env });
+    }
+    // 音乐（播放列表读取公开；上传需管理会话，R2 直传）
+    if (url.pathname === '/api/music/upload-url') {
+      return handleMusicUploadUrl(request, env);
+    }
+    if (url.pathname === '/api/music') {
+      return handleMusic(request, env);
+    }
+    mm = url.pathname.match(/^\/api\/music\/([^/]+)$/);
+    if (mm) {
+      return handleMusicId(request, env, decodeURIComponent(mm[1]));
+    }
 
     // 未知 /api/* 路径：返回 JSON 404，绝不回退到 index.html（避免 API 调用方收到 HTML）
     if (url.pathname === '/api' || url.pathname.indexOf('/api/') === 0) {
       return new Response(JSON.stringify({ ok: false, error: 'Not Found' }), {
         status: 404,
-        headers: { 'Content-Type': 'application/json; charset=utf-8' }
+        headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, securityHeaders())
       });
     }
 
     // 静态资源（index.html / style.css / app.js / …）
     if (env.ASSETS) {
-      const res = await env.ASSETS.fetch(request);
+      let res = await env.ASSETS.fetch(request);
       // SPA 回退：干净路径 / 首页 / 归档 / 关于 / 标签 / /posts/<别名>/ /admin / /write，
       // 以及 /api 以外的任何无扩展名路径，都返回 index.html（由前端 app.js 依据 pathname 渲染）。
       // 仅对 GET/HEAD 回退：POST 等非幂等方法拿到 HTML 会误导调用方。
       if (res.status === 404 && (request.method === 'GET' || request.method === 'HEAD') && !/\.[a-zA-Z0-9]+$/.test(url.pathname)) {
-        const idx = await env.ASSETS.fetch(new Request(url.origin + '/', request));
-        if (idx.status === 200) return idx;
+        res = await env.ASSETS.fetch(new Request(url.origin + '/', request));
+      }
+      // 性能：给静态资源加缓存头，避免每次刷新全量重下大文件（app.js 184KB / style.css 94KB）。
+      //  · 带扩展名的静态文件：1 小时强缓存 + 1 天 SWR（部署后 CF_ZONE_ID purge 立即生效，无陈旧感）
+      //  · 无扩展名（HTML SPA 入口）：no-cache（每次重新验证，ETag 命中即 304，体积极小）
+      // 安全：所有静态响应统一附带安全响应头（nosniff / CSP / frame 防护等）。
+      try {
+        const headers = new Headers(res.headers);
+        Object.keys(securityHeaders()).forEach(function (k) { headers.set(k, securityHeaders()[k]); });
+        const hasExt = /\.[a-zA-Z0-9]+$/.test(url.pathname);
+        // 版本化资源（style.css?v=…、app.js?v=…）与字体/图标等不可变资源，可放心一年强缓存；
+        // 其余扩展名静态文件保持 1 小时 + SWR（部署后仍能快速生效）。
+        const versioned = url.search && url.search.indexOf('v=') === 1;
+        const immutablePath = /^\/fonts\/|^\/flags\/|^\/libs\/smoji\//.test(url.pathname);
+        if (hasExt && request.method === 'GET') {
+          headers.set('Cache-Control', versioned || immutablePath
+            ? 'public, max-age=31536000, immutable'
+            : 'public, max-age=3600, stale-while-revalidate=86400');
+        } else if (request.method === 'GET') {
+          headers.set('Cache-Control', 'no-cache');
+        }
+        return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+      } catch (e) {
         return res;
       }
-      return res;
     }
     return new Response('Not Found', { status: 404 });
   }

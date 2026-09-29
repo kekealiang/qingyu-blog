@@ -10,7 +10,7 @@
 #   构建输出目录 public/，functions/ 自动打包成 Pages Functions。
 # · 本地预览：npx wrangler pages dev
 # ============================================================
-name = "azhz"   # Workers 部署默认 worker 名（子域名 azhz.workers.dev）
+name = "azhz"   # Workers 部署默认 worker 名（线上绑定自定义域名 https://www.2024921.xyz）
 compatibility_date = "2025-02-01"
 
 # Cloudflare Pages：静态资源目录（也是构建输出目录）

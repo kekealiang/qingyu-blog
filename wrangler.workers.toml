@@ -2,8 +2,8 @@
 # 轻语博客 · Cloudflare Workers 配置
 # ------------------------------------------------------------
 # 部署：npx wrangler deploy -c wrangler.workers.toml
-#   （Workers 部署。域名格式 <worker名>.<账户子域>.workers.dev：
-#    worker 名 = kejiland，账户子域 = azhz → kejiland.azhz.workers.dev。
+#   （Workers 部署。域名格式可绑定自定义域名（如 https://www.2024921.xyz）：
+#    worker 名 = kejiland，账户子域 = azhz → www.2024921.xyz。
 #    如 GitHub Secrets 里设置了 PAGES_PROJECT_NAME 则用它覆盖 --name）
 # 与 Pages 共用的 KV 绑定也在此声明。
 # ------------------------------------------------------------
@@ -34,6 +34,28 @@ preview_id = "{env.BLOG_KV_ID}"
 binding = "DB"
 database_name = "blog"
 database_id = "{env.BLOG_D1_ID}"
+
+# Workers AI 推理（绑定名 AI，与 functions/_lib/ai.js 的 env.AI 对应）
+# 注意：wrangler 3.x 的 ai 是「对象」配置（[ai]），不是数组（[[ai]]）
+[ai]
+binding = "AI"
+
+# ── 边缘限流（可选，默认关闭）────────────────────────────────
+# Workers Rate Limiting API：给 /api/admin/login 加一层不消耗 D1/KV 配额的限流，
+# 代码里通过 env.LOGIN_LIMITER 使用（缺失时自动回退到 D1 计数，功能不受影响）。
+#
+# 为什么不直接写在这里：该绑定需要 wrangler >= 4.36，且并非所有账户都能部署。
+# 开启方式：在 GitHub Secrets 里加一个 BLOG_RATE_LIMIT_BINDING（值为正整数命名空间，
+# 例如 1001），部署工作流会自动切换 wrangler 4.x 并把下面这段注入 CI 配置：
+#
+#   [[ratelimits]]
+#   name = "LOGIN_LIMITER"
+#   namespace_id = "1001"
+#     [ratelimits.simple]
+#     limit = 10      # 每个 Cloudflare 数据中心、每个 key、每个周期允许的次数
+#     period = 60     # 只能是 10 或 60（秒）
+#
+# 注意：计数器按数据中心本地缓存、最终一致，定位是「防滥用」而非精确计费。
 
 # 非敏感环境变量（部署时由 Actions 把 {env.X} 替换为对应 GitHub Secret；缺失则为空，功能降级不报错）
 #   SITE_URL    ：站点对外域名（如 https://blog.example.com）。配置后 CORS 仅允许本站来源，更安全。
