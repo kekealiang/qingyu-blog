@@ -162,6 +162,9 @@ Add these under **Settings → Secrets and variables → Actions → Secrets** i
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_ENDPOINT` | R2 S3-compatible credentials (audio and images **share** one pair) |
 | `R2_BUCKET` / `R2_PUBLIC_BASE` | **Music bucket**: bucket name + public domain (**must not be empty**, otherwise no R2 config is written at all) |
 | `R2_MEDIA_BUCKET` / `R2_MEDIA_PUBLIC_BASE` | **Media bucket**: bucket name + public domain |
+| `R2_BACKUP_BUCKET` | **Private backup bucket** for automatic/manual JSON backups; do not attach a public domain. Backup is disabled when unset |
+| `RESEND_API_KEY` / `BLOG_MAIL_FROM` | Email subscription and notifications via Resend; enabled when both plus `SITE_URL` are set |
+| `BLOG_MAIL_REPLY_TO` | Optional reply-to email |
 | `PAGES_PROJECT_NAME` | Misleading name: it actually overrides the **Worker name** (`--name`). Leave empty to keep `kejiland` from `wrangler.workers.toml`. Beginners should not set it. |
 | `BLOG_RATE_LIMIT_BINDING` | Enables in-Worker edge rate limiting for login (a positive integer namespace, e.g. `1001`); switches deploys to wrangler 4.x. Remove it if your account does not support the binding |
 | `BLOG_WRITE_TOKEN` | Legacy write token, not needed for new deployments |
@@ -169,7 +172,7 @@ Add these under **Settings → Secrets and variables → Actions → Secrets** i
 Push to `main` (or run the workflow manually) and GitHub Actions will:
 
 1. ✅ Install the Wrangler CLI
-2. ✅ Run three test suites (`smoke-test.js` 78 cases / `gb-verify.js` 18 / `search-verify.js` 13 — a failure aborts the deploy)
+2. ✅ Run three test suites (`smoke-test.js` 85 cases / `gb-verify.js` 18 / `search-verify.js` 13 — a failure aborts the deploy)
 3. ✅ Validate the required secrets and ID formats
 4. ✅ Apply D1 migrations (three-layer idempotency: `schema_migrations` ledger + column pre-check + tolerant error matching)
 5. ✅ Deploy the Worker
@@ -203,19 +206,26 @@ Or trigger the `Migrate KV to D1` workflow manually from the Actions tab (`dry-r
 | Real-path routing | No hashes: `/`, `/archive`, `/tags`, `/about`, `/guestbook`, `/posts/<id>/`, `/admin`, `/write` — no 404 on refresh |
 | Markdown renderer | Headings / tables / blockquotes / lists / fenced code (syntax highlighting for js, ts, python, bash, css) / inline code / bold, italic, strikethrough / images / links. Input is escaped first; raw HTML never executes |
 | Table of contents | Auto-numbered (1 / 1.1 / 1.2 …), anchor links, collapsible, smooth scrolling |
-| Reading experience | Reading-time estimate, view count, likes (per-browser dedup), pin badge, **copy link**, back-to-top |
+| Reading experience | Reading-time estimate, view count, likes (per-browser dedup), pin badge, **one-tap share** (copy link / native share / Weibo / X / Facebook / Telegram / email), back-to-top |
+| **Reading size & floating TOC** | Article pages offer one-tap body font sizing (A− / A / A+, remembered locally); on mobile a floating button opens the full table of contents as a bottom sheet |
+| **Immersive reading** | Article images open in a full-screen lightbox with keyboard navigation; a top reading-progress bar tracks position and the table of contents highlights the current section |
+| **Announcement bar** | Enabled from Settings → Site info; shows a notice with an optional link under the top bar. Visitors can dismiss it and the choice is remembered |
+| **Popular posts** | `/popular` ranks articles by views×1 + likes×3 + comments×5, with all-time, 7-day and 30-day ranges in cloud mode |
 | Comments | Cloud D1 global comments + moderation mode; **up to 3 levels of nested replies**; orphaned replies are promoted; deleting a post cascades to its comments / likes / views; **duplicate blocking** (same section + author + content → 409) and rate limiting (5 per minute per IP) |
+| **Comment interactions** | Comments support likes, featuring and pinning; readers can switch between Top / Newest with top-level pagination (8 per page, load more), and admins can toggle feature / pin in one click |
 | Guestbook | Reachable at `/guestbook` with two sections (messages / feature ideas), cloud-stored, reusing the comment security pipeline; supports `Ctrl/⌘ + Enter` |
-| Site search | Live matching over title / tags / excerpt / body; results show the **full sentence around the keyword** with **highlighting**, plus an empty state |
+| **Full-text search** | Cloud search uses a D1 FTS5 (trigram) index over titles, tags, excerpts and bodies, with substring matching, relevance ranking, highlighting and load-more pagination. Short terms fall back to LIKE; static mode keeps local search |
 | Tags & archive | Home tag filter (`?tag=`, clearable), tag cloud with counts, archive grouped by year → month |
 | Featured posts | Auto-recommended below the comments (**likes×3 + views×1 + comments×5**, top 2, excluding the current post and drafts) |
+| **Bidirectional links & related posts** | Use `[[Post title]]` in Markdown to create links between posts. Article pages show “Linked from” backlinks plus related posts ranked by shared tags, series and recency |
 | RSS / Sitemap | `/feed.xml` and `/sitemap.xml` generated dynamically from D1; drafts and encrypted posts excluded |
 | Prev / Next | Hides the empty slot when only one direction exists |
 | Card list | Cover thumbnails (from `cover` or the first image in the body), pin badge, tags pinned to the bottom, loading skeleton, pagination (`?page=`) |
 | **Dark / light theme** | One-click toggle, follows the system preference, no flash of unstyled content; the top bar deepens its shadow as you scroll |
 | **Accent colours** | **4 accents**: Terra (赭橙) / Indigo (黛蓝) / Bamboo (竹青) / Dusk (凝夜紫). Icon button with a swatch popover on desktop, native select on mobile; each accent also retints backgrounds and borders |
-| **Multilingual UI** | Chinese / English / 日本語 / 한국어 / हिन्दी (498 keys each), auto-detect + manual switch (🌐 popover with SVG flags on desktop, native select on mobile) |
-| **Background animation** | Hand-drawn canvas particles for the four seasons (spring petals / summer motes / autumn leaves / snow); home page only, pauses when the tab is hidden; on by default on desktop, off on touch devices, toggleable from the top bar, respects `prefers-reduced-motion` |
+| **Multilingual UI** | Chinese / English / 日本語 / 한국어 / हिन्दी (777 keys each), auto-detect + manual switch (🌐 popover with SVG flags on desktop, native select on mobile) |
+| **PWA offline reading & writing** | Installable on desktop or mobile; the shell, core assets and previously visited articles work offline. Cloud editor changes are queued locally and synced automatically when the connection returns |
+| **Background animation** | Hand-drawn canvas particles for the four seasons (spring petals / summer green leaves / autumn leaves / six-armed branched snowflakes); home page only, pauses when the tab is hidden; on by default on desktop, off on touch devices, toggleable from the top bar, respects `prefers-reduced-motion`. Preview: `/?season=spring\|summer\|autumn\|winter&bg=1` |
 | **Smoji picker** | Emoji picker in the comment box, guestbook and editor, lazily loaded, with inline rendering in content |
 | **AI post summary** | One-click summary on any post page (30-day per-post cache); the entry hides itself when AI is unavailable |
 | **Music player** | Floating note button at the bottom right that stays **tucked outside the window with just an arc showing**, sliding out on hover or click. The panel has track info, a draggable seek bar, prev / play-pause / next, volume and a playlist (active item highlighted with an equaliser animation). Auto-advance, **remembers the last track and position**, volume persisted, restores after refresh but **never plays automatically**; hides entirely when there are no tracks and collapses on admin routes; its CSS and JS stay off the critical path |
@@ -230,17 +240,27 @@ The admin panel is a separate bundle (`admin.js` + `admin.css`) lazy-loaded only
 | --- | --- |
 | Routes | `/admin` (dashboard), `/admin/posts`, `/admin/posts/new`, `/admin/posts/:id/edit`, `/admin/tags`, `/admin/comments`, `/admin/comments/pending`, `/admin/media`, `/admin/music`, `/admin/settings`; unknown `/admin/*` falls back to the dashboard |
 | Login gate | Cloud: password login or "First deploy? Initialize with setup key" (via the `X-Setup-Key` header). When login throttling kicks in, the page automatically reveals a **"Rate limited? Sign in with the setup key"** break-glass entry (it skips only the throttle, never the password check). Static: local gate. Any 401 shows "session expired" and returns to the login page |
-| Dashboard | **6 stat cards** (total posts / published / drafts / pinned / total comments / pending) + **two 30-day line charts** (inline SVG, hover preview and click-to-pin values) + latest posts / latest comments (auto-scrolling, pauses on hover) |
-| Post management | Keyword search (title + tags, 250 ms debounce), status filter (all / published / draft), 10 per page, optimistic pin toggle, **seamless delete** (row fades out; comments and stats are cascaded server-side) |
-| Editor | Title / tags / cover (pick from the media library) / pinned / Markdown body; **live preview**, auto-growing input, toolbar (bold, italic, heading, quote, code, list, link, image, emoji); save as draft or publish |
+| Dashboard | **7 stat cards** (total posts / published / scheduled / drafts / pinned / total comments / pending) + **two 30-day line charts** (inline SVG, hover preview and click-to-pin values) + latest posts / latest comments (auto-scrolling, pauses on hover)  + **storage & subscription overview** (media count and size / music / subscribers and active count / backups and latest time) |
+| **Post analytics** | A dedicated analytics page shows views, likes, comments and a combined score for every post, with all-time / 7-day / 30-day ranges, per-post trend charts, CSV export and draft visibility |
+| Post management | Keyword search (title + tags, 250 ms debounce), status filter (all / published / scheduled / draft), 10 per page, optimistic pin toggle, **multi-select bulk pin / unpin / delete with confirmation**, **seamless delete** (row fades out; comments and stats are cascaded server-side) |
+| Scheduled publishing | In cloud mode, choose a future publish time; a Worker Cron checks every 5 minutes and publishes automatically. Scheduled posts are hidden from the public site, RSS and Sitemap |
+| **Version history** | Every save keeps up to 50 snapshots; browse versions, inspect body diffs and restore any version with one click |
+| **Backup & restore** | Manual backups plus a daily 03:00 Asia/Shanghai Worker Cron backup of posts, revisions, comments, media metadata, music, settings and stats to private R2. Keeps 30 backups and **paginated (10 per page) with a content summary per backup (posts / comments / media / music / subscribers)**, and supports download, delete and one-click restore with an automatic pre-restore snapshot |
+| **Series** | Assign posts to a named series and order. `/series` lists all series; series pages order posts by number and provide previous/next navigation. Admin supports renaming and removing series |
+| **Email subscription** | Public `/subscribe` form with double opt-in; new posts are queued and delivered asynchronously by Cron. Admin supports **email search + status filter + pagination (20 per page)**, CSV export of the current filter, and deletion |
+| **Automatic share image** | The editor generates a 1200×630 PNG from title, date, series and tags and uploads it to R2. The public site emits `og:image` and `twitter:image`, falling back to the cover image |
+| **Image compression & paste upload** | Media uploads are compressed to WebP with generated thumbnails. The editor accepts pasted screenshots, uploads them and inserts Markdown automatically |
+| Editor | Title / publish date (minute precision, preserved while editing) / tags / cover (pick from the media library) / pinned / Markdown body; **live preview**, **live word count + estimated reading time**, shortcuts (Ctrl/⌘ + B / I / K / S), auto-growing input, toolbar (bold, italic, heading, quote, code, list, link, image, emoji, **table, task list, divider, fenced code block with language picker**); save as draft or publish |
 | **AI writing assistant** | One click for title suggestions / polish / translation (5 target languages); apply the result to the title, replace the body, append it, or copy it. The whole bar is not rendered when AI is unavailable |
 | Comment management | Global list (author / content / post / time / status / actions), keyword search, status filter, **approve** (badge updates in place, no table reload), delete (row fades out); the sidebar shows a live pending-count badge |
 | **AI comment tools** | Summarize recent comment threads (1-hour cache) and screen a single comment for spam (red / green verdict with a reason) |
+| **Comment email notifications** | New comments and replies are queued and delivered asynchronously by Cron. The recipient uses `BLOG_ADMIN_EMAIL` first, then the profile email |
 | Tag management | Tag list derived from the posts in real time; rename / delete with bulk updates |
-| Media library | Image upload (browser **direct to R2** via a presigned URL, metadata in D1), grid preview, copy URL, delete (removes the R2 object first, then the D1 row); static / non-cloud environments show an explanatory card |
-| **Music management** | Audio upload (direct to R2 with a percentage progress bar, drag-and-drop supported); **filename parsing fills in "song - artist"**; inline per-row preview (play / pause / seek / elapsed and total time), rename, delete (synced with the R2 object); inner-scrolling list card with a sticky table header |
+| Media library | Image upload (browser **direct-to-R2** presigned URLs, metadata in D1), grid preview, **click a thumbnail for a full preview (arrow keys / Esc to close)**, **file-name search + pagination (24 per page)**, **multi-select bulk delete**, copy URL or **copy Markdown image syntax**, delete (R2 object first, then the D1 row); static / non-cloud mode shows a hint |
+| **Music management** | Audio upload (direct to R2 with a percentage progress bar, drag-and-drop supported); **filename parsing fills in "song - artist"**; **title / artist search + pagination (15 per page)**; inline per-row preview (play / pause / seek / elapsed and total time), rename, delete (synced with the R2 object); inner-scrolling list card with a sticky table header |
 | Blog settings | 5 tabs: **Site basics** (name / description / avatar logo / about-page content / footer copyright / footer notice / moderate new comments), **Profile** (name / bio / avatar / email), **Navigation menu** (visual editor with add / remove / sub-items / reset), **Footer navigation**, **Friend links** |
 | Top bar | Sidebar collapse, breadcrumb, preview site, 🌐 language switch, account menu (profile / change password / logout) |
+| Import / export | Import a single file, multiple files, or a folder; export one Markdown file, selected posts as a ZIP, all posts, or a full JSON backup. Works in both static and cloud modes |
 | One-click export | **Static mode only**: the editor's "export all" writes `posts.js` + `feed.xml` + `sitemap.xml` for you to overwrite `public/` with. Cloud mode generates RSS/Sitemap server-side, so there is no export entry there |
 | Responsive | Fixed sidebar on desktop (collapsible to a 72 px icon rail) / drawer navigation on mobile; breakpoints at 1100 / 991 / 640 / 420 px |
 
@@ -268,7 +288,7 @@ The admin panel is a separate bundle (`admin.js` + `admin.css`) lazy-loaded only
 
 ### Admin panel
 
-| Login gate (setup key supported) | Dashboard (6 stat cards + 30-day trends) | Dark mode |
+| Login gate (setup key supported) | Dashboard (7 stat cards + 30-day trends) | Dark mode |
 | --- | --- | --- |
 | ![Login](screenshots/admin-gate.png) | ![Dashboard](screenshots/admin.png) | ![Admin dark](screenshots/admin-dark.png) |
 
@@ -299,6 +319,9 @@ The admin panel is a separate bundle (`admin.js` + `admin.css`) lazy-loaded only
 │   ├── config.js / config.min.js      # Site config (mode / site URL / footer / ads)
 │   ├── style.css / style.min.css      # Site styles (light+dark, 4 accents, responsive, serif stack)
 │   ├── app.js / app.min.js            # Frontend logic (routing / Markdown / search / comments / guestbook / stats / i18n / AI summary)
+│   ├── manifest.webmanifest           # PWA manifest
+│   ├── sw.js                          # Offline-cache service worker
+│   ├── icons/                         # PWA desktop / mobile icons
 │   ├── admin.js / admin.min.js        # Admin SPA (lazy-loaded)
 │   ├── admin.css / admin.min.css      # Admin styles (responsive)
 │   ├── music-player.js / .min.js      # Global music player (FAB + panel + playlist + progress memory)
@@ -306,7 +329,7 @@ The admin panel is a separate bundle (`admin.js` + `admin.css`) lazy-loaded only
 │   ├── bg-anim.js / bg-anim.min.js    # Four-season canvas background animation
 │   ├── i18n.js / i18n.min.js          # i18n module (zh/en/ja/ko/hi, built-in Chinese fallback)
 │   ├── posts.js / posts.min.js        # Static-mode post data (generated by "Export posts.js")
-│   ├── locales/                       # Language packs (zh-CN / en / ja / ko / hi, 498 keys each)
+│   ├── locales/                       # Language packs (zh-CN / en / ja / ko / hi, 777 keys each)
 │   ├── flags/                         # SVG flags for the language switcher (cn / gb / jp / kr / in)
 │   ├── libs/smoji/                    # Smoji emoji picker (lazy-loaded)
 │   ├── fonts/dreamserif/              # ⚠️ Legacy local serif shards (no longer loaded; see Known Limitations)
@@ -376,7 +399,7 @@ The admin panel is a separate bundle (`admin.js` + `admin.css`) lazy-loaded only
 ├── index.html                         # Root redirect (opens public/index.html)
 ├── wrangler.toml                      # Cloudflare Pages config
 ├── wrangler.workers.toml              # Cloudflare Workers config (used for deploys)
-├── smoke-test.js                      # Smoke tests (78 cases)
+├── smoke-test.js                      # Smoke tests (85 cases)
 ├── gb-verify.js                       # Guestbook verification (18 cases)
 ├── search-verify.js                   # Search verification (13 cases)
 ├── README.md                          # 中文说明
@@ -477,6 +500,7 @@ KV is not post storage — it holds counters and caches:
 | `site_settings` | Site settings | k, v |
 | `site_files` | Site artifacts | name, content, updated_at |
 | `music` | Music metadata | id, title, artist, url, cover, size, duration, sort, created_at |
+| `posts_fts` | D1 FTS5 full-text index (external-content, synced with posts) | id, title, excerpt, content, tags |
 | `schema_migrations` | CI ledger | name, applied_at |
 
 `0015_hot_path_indexes.sql` adds 5 hot-path indexes: `idx_comments_post_id`, `idx_comments_status_date`, `idx_music_sort`, `idx_media_created_id`, `idx_admin_sessions_exp`.
@@ -571,7 +595,7 @@ window.BLOG_CONFIG = {
 
 ### Multilingual (i18n)
 
-`i18n.js` ships 5 languages (Chinese / English / 日本語 / 한국어 / हिन्दी) with **498 keys each**. Detection order: `localStorage('blog.locale')` → `navigator.language`, plus a manual switcher. Packs live in `public/locales/<lang>.json`; Chinese is also embedded as a fallback so core text stays readable when previewing via `file://`.
+`i18n.js` ships 5 languages (Chinese / English / 日本語 / 한국어 / हिन्दी) with **777 keys each**. Detection order: `localStorage('blog.locale')` → `navigator.language`, plus a manual switcher. Packs live in `public/locales/<lang>.json`; Chinese is also embedded as a fallback so core text stays readable when previewing via `file://`.
 
 ---
 
@@ -614,7 +638,7 @@ The step-by-step dashboard walkthrough is in section 9 of the **[Cloudflare setu
 ## 🧪 Tests
 
 ```bash
-node smoke-test.js      # Smoke tests: 78 cases (Markdown / TOC / highlighting / import-export / admin gate / comment security / stats / search / RSS / Sitemap / cloud API / caching …)
+node smoke-test.js      # Smoke tests: 85 cases (Markdown / TOC / highlighting / import-export / admin gate / comment security / stats / search / RSS / Sitemap / cloud API / caching …)
 node gb-verify.js       # Guestbook verification: 18 cases
 node search-verify.js   # Search verification: 13 cases
 ```
@@ -647,7 +671,7 @@ node scripts/minify.mjs     # requires npx terser / clean-css-cli
 | A throttled login means a short wait | Once throttled, even the correct password has to wait 10 seconds (global cooldown) / 60 seconds (same subnet) / 15 minutes (your own IP) — unless you use the setup-key break-glass path. This is deliberate: still running PBKDF2 while locked would turn a login DoS into a CPU/quota DoS |
 | `must_change` is not enforced | The backend returns the flag, but the UI only shows a tip and never blocks |
 | `public/fonts/dreamserif/` is dead weight | The current version loads **no webfonts**; this directory (~10.3 MB, 265 shards) is unreferenced and kept only because of a `.gitignore` whitelist. Deleting it changes nothing functionally |
-| No pagination in some admin views | The comment list and media library fetch everything at once, which gets slow with a lot of data |
+| Admin search filters client-side | List search filters rows already fetched (10-24 per page); with very large datasets the first load still takes longer |
 | Unknown paths return HTTP 200 | The frontend 404 page still answers with status 200 (a common SPA trade-off) |
 
 ---

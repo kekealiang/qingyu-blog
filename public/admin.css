@@ -442,6 +442,14 @@ select.ab-select { cursor: pointer; padding-right: 30px; }
 .ab-btn:disabled { opacity: .55; cursor: not-allowed; transform: none; }
 
 /* ---------- 表格 ---------- */
+/* ====================== 文章数据分析 ====================== */
+.ab-analytics-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.ab-analytics-tabs .ab-btn.active { background: var(--ab-primary); border-color: var(--ab-primary); color: #fff; }
+.ab-analytics-score { color: var(--ab-primary); font-variant-numeric: tabular-nums; }
+.ab-stat-num.small { font-size: 15px; line-height: 1.3; word-break: break-word; }
+.ab-sparkline { display: block; width: 96px; height: 26px; overflow: visible; }
+.ab-sparkline polyline { fill: none; stroke: var(--ab-primary); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ab-td-trend { min-width: 112px; }
 .ab-table-wrap {
   background: var(--ab-card);
   border: 1px solid var(--ab-border); border-radius: var(--ab-radius);
@@ -499,13 +507,25 @@ select.ab-select { cursor: pointer; padding-right: 30px; }
 .ab-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 6px currentColor; }
 .ab-status.published { color: var(--ab-ok); background: color-mix(in srgb, var(--ab-ok) 12%, transparent); }
 .ab-status.draft { color: var(--ab-warn); background: color-mix(in srgb, var(--ab-warn) 14%, transparent); }
+.ab-status.scheduled { color: var(--ab-primary); background: color-mix(in srgb, var(--ab-primary) 12%, transparent); }
 .ab-status.approved { color: var(--ab-ok); background: color-mix(in srgb, var(--ab-ok) 12%, transparent); }
 .ab-status.pending { color: var(--ab-warn); background: color-mix(in srgb, var(--ab-warn) 14%, transparent); }
+
+/* ---------- 评论置顶 / 精选徽章 ---------- */
+.ab-cmt-badge { display: inline-flex; align-items: center; gap: 3px; margin: 2px 0 0 6px; padding: 1px 8px; border-radius: 999px; font-size: 11px; line-height: 1.7; vertical-align: middle; white-space: nowrap; }
+.ab-cmt-badge.pinned { color: var(--ab-primary); background: var(--ab-primary-weak); }
+.ab-cmt-badge.featured { color: #9a6a14; background: color-mix(in srgb, #d7a33d 20%, transparent); }
+.ab-table tbody tr.ab-cmt-pinned > td:first-child { box-shadow: inset 3px 0 0 var(--ab-primary); }
 
 /* ---------- 空状态 ---------- */
 .ab-empty { text-align: center; padding: 54px 20px; color: var(--ab-muted); }
 .ab-empty .ab-empty-ico { font-size: 36px; opacity: .45; margin-bottom: 12px; display: block; }
 .ab-empty p { margin: 4px 0; }
+
+/* ---------- 批量操作条 ---------- */
+.ab-bulk { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; padding: 10px 14px; border-radius: var(--ab-radius-sm); background: var(--ab-primary-weak); }
+.ab-table .col-check { width: 36px; text-align: center; }
+.ab-table tbody tr.selected { background: var(--ab-primary-weak); }
 
 /* ---------- 媒体库 ---------- */
 .ab-media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
@@ -521,6 +541,22 @@ select.ab-select { cursor: pointer; padding-right: 30px; }
 .ab-media-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ab-media-size { font-size: 11px; color: var(--ab-muted); margin-top: 2px; }
 .ab-media-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 12px; }
+.ab-media-card { position: relative; }
+.ab-media-card.selected { border-color: var(--ab-primary); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ab-primary) 38%, transparent); }
+.ab-media-check { position: absolute; top: 8px; left: 8px; z-index: 2; display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 7px; background: rgba(255,255,255,.88); box-shadow: 0 2px 6px rgba(0,0,0,.18); cursor: pointer; }
+.ab-media-check input { margin: 0; cursor: pointer; }
+.ab-media-thumb { cursor: zoom-in; }
+
+/* ---------- 媒体大图预览 ---------- */
+.ab-lightbox { display: none; position: fixed; inset: 0; z-index: 300; background: rgba(0,0,0,.84); align-items: center; justify-content: center; }
+.ab-lightbox.open { display: flex; }
+.ab-lb-img { max-width: 88vw; max-height: 84vh; border-radius: 10px; box-shadow: 0 20px 50px rgba(0,0,0,.5); }
+.ab-lb-close { position: absolute; top: 18px; right: 22px; width: 38px; height: 38px; border-radius: 50%; border: 0; background: rgba(255,255,255,.14); color: #fff; font-size: 16px; cursor: pointer; }
+.ab-lb-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 44px; height: 44px; border-radius: 50%; border: 0; background: rgba(255,255,255,.14); color: #fff; font-size: 24px; line-height: 1; cursor: pointer; }
+.ab-lb-nav.prev { left: 22px; }
+.ab-lb-nav.next { right: 22px; }
+.ab-lb-close:hover, .ab-lb-nav:hover { background: rgba(255,255,255,.3); }
+.ab-lb-counter { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); color: rgba(255,255,255,.88); font-size: 12.5px; }
 
 /* ---------- 音乐管理：行内迷你播放器 + 空封面占位 ---------- */
 .ab-cover-ph {
@@ -563,6 +599,9 @@ select.ab-select { cursor: pointer; padding-right: 30px; }
 .ab-editor-toolbar { display: flex; gap: 4px; padding: 8px; border-bottom: 1px solid var(--ab-border); flex-wrap: wrap; background: color-mix(in srgb, var(--ab-hover) 75%, transparent); }
 .ab-tool { width: 33px; height: 31px; border: none; background: transparent; border-radius: var(--ab-radius-xs); cursor: pointer; color: var(--ab-text); display: inline-flex; align-items: center; justify-content: center; font-size: 14px; transition: background .12s, color .12s; }
 .ab-tool:hover { background: var(--ab-card-solid); color: var(--ab-primary); }
+.ab-tool-select { height: 31px; border: 1px solid var(--ab-border-strong); border-radius: var(--ab-radius-xs); background: var(--ab-card-solid); color: var(--ab-text); font-size: 12px; padding: 0 6px; font-family: inherit; cursor: pointer; }
+.ab-editor-stats { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 6px 10px; font-size: 12px; color: var(--ab-muted); border-top: 1px solid var(--ab-border); }
+.ab-editor-stats .ab-hint { margin: 0; }
 .ab-editor-area { min-height: 420px; border: none; outline: none; padding: 16px; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 14px; line-height: 1.7; resize: none; overflow: hidden; background: var(--ab-card-solid); color: var(--ab-text); width: 100%; box-sizing: border-box; height: auto; }
 /* 编辑器底部操作条：右对齐、统一上间距与按钮间隙 */
 .ab-editor-actions { margin-top: 18px; justify-content: flex-end; gap: 10px; }
@@ -689,7 +728,15 @@ select.ab-select { cursor: pointer; padding-right: 30px; }
   .ab-header-btn span.ab-hide-sm { display: none; }
   .ab-breadcrumb .ab-hide-sm { display: none; }
   .ab-content { padding: 14px; }
-  .ab-table-wrap { overflow-x: auto; }
+  /* ====================== 文章数据分析 ====================== */
+.ab-analytics-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.ab-analytics-tabs .ab-btn.active { background: var(--ab-primary); border-color: var(--ab-primary); color: #fff; }
+.ab-analytics-score { color: var(--ab-primary); font-variant-numeric: tabular-nums; }
+.ab-stat-num.small { font-size: 15px; line-height: 1.3; word-break: break-word; }
+.ab-sparkline { display: block; width: 96px; height: 26px; overflow: visible; }
+.ab-sparkline polyline { fill: none; stroke: var(--ab-primary); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ab-td-trend { min-width: 112px; }
+.ab-table-wrap { overflow-x: auto; }
   .ab-table { min-width: 560px; }
   .ab-page-head { gap: 8px; }
   .ab-hide-xs { display: none !important; }

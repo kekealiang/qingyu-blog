@@ -48,6 +48,43 @@
     if (!s) return '';
     return s.slice(0, 10);
   }
+  function pad2(n) { return String(n).padStart(2, '0'); }
+  function fmtPostDate(s) {
+    var raw = String(s || '').trim();
+    var m = raw.match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{1,2}):(\d{2}))?/);
+    if (!m) return raw;
+    return m[1] + (m[2] ? ' ' + (m[2].length === 1 ? '0' + m[2] : m[2]) + ':' + m[3] : '');
+  }
+  function localDateTimeValue(d) {
+    d = d || new Date();
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T'
+      + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+  function toDateTimeLocal(v) {
+    var s = String(v || '').trim();
+    if (/^\d{12,}$/.test(s)) {
+      var d = new Date(Number(s));
+      if (!isNaN(d.getTime())) return localDateTimeValue(d);
+    }
+    var m = s.match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{1,2}):(\d{2}))?$/);
+    if (m) return m[1] + 'T' + (m[2] ? (m[2].length === 1 ? '0' + m[2] : m[2]) + ':' + m[3] : '00:00');
+    return s;
+  }
+  function dateTimeLocalToMs(v) {
+    var s = String(v || '').trim();
+    if (!s) return null;
+    var ms = Date.parse(s);
+    return isNaN(ms) ? null : ms;
+  }
+  function fmtTimestamp(ms) {
+    var n = Number(ms) || 0;
+    if (!n) return '';
+    return localDateTimeValue(new Date(n)).replace('T', ' ');
+  }
+  function normalizeEditorDate(v) {
+    var s = String(v || '').trim().replace('T', ' ');
+    return s || localDateTimeValue(new Date()).replace('T', ' ');
+  }
   function fmtSize(n) {
     n = Number(n) || 0;
     if (n < 1024) return n + ' B';
@@ -153,8 +190,14 @@
     if (cloudOn()) {
       // 时间戳穿透边缘缓存（api/posts 带 s-maxage=60）：删除/发布后管理端必须立即看到最新列表，
       // 否则命中缓存会误以为「删除没生效，要刷新网页才删掉」。查询参数变化 = 边缘缓存 key 变化。
-      var d = await api('api/posts?_=' + Date.now());
-      return (d && d.posts) || [];
+      // all=1 需管理员会话：附带草稿；公开的 api/posts 仍只返回已发布文章。
+      try {
+        var d = await api('api/posts?all=1&_=' + Date.now());
+        return mergeOfflinePosts((d && d.posts) || []);
+      } catch (e) {
+        if (isNetworkFailure(e)) return readOfflineQueue().map(function (item) { return item.post; });
+        throw e;
+      }
     }
     // 静态模式：BLOG_POSTS 合并本地草稿
     var base = (window.getStaticPosts ? window.getStaticPosts() : []) || [];
@@ -165,25 +208,112 @@
     drafts.forEach(function (p) { if (p && p.id) map[p.id] = p; });
     return Object.keys(map).map(function (k) { return map[k]; });
   }
+  async function listFullPosts() {
+    if (cloudOn()) {
+      // full=1 仅管理员可用：一次返回草稿 + 正文，避免批量导出逐篇请求。
+      try {
+        var d = await api('api/posts?full=1&_=' + Date.now());
+        return mergeOfflinePosts((d && d.posts) || []);
+      } catch (e) {
+        if (isNetworkFailure(e)) return readOfflineQueue().map(function (item) { return item.post; });
+        throw e;
+      }
+    }
+    return await listPosts();
+  }
   async function getPost(id) {
     if (cloudOn()) {
-      try { var d = await api('api/posts/' + encodeURIComponent(id) + '?_=' + Date.now()); return d && d.post; } catch (e) { return null; }
+      try {
+        var d = await api('api/posts/' + encodeURIComponent(id) + '?_=' + Date.now());
+        if (d && d.post) return d.post;
+      } catch (e) {}
+      var queued = readOfflineQueue().find(function (item) { return String(item.post.id) === String(id); });
+      return queued ? queued.post : null;
     }
     var all = await listPosts();
     for (var i = 0; i < all.length; i++) if (all[i].id === id) return all[i];
     return null;
   }
-  function saveStaticPost(post) {
+  function saveStaticPost(post, reason) {
     var drafts = [];
     try { drafts = JSON.parse(localStorage.getItem('qingyu.drafts') || '[]'); } catch (e) {}
     var idx = -1;
     for (var i = 0; i < drafts.length; i++) if (drafts[i] && drafts[i].id === post.id) idx = i;
     var item = { id: post.id, title: post.title, date: post.date, tags: post.tags || [], excerpt: post.excerpt || '',
-      cover: post.cover || '', category: post.category || '', status: post.status || 'published',
-      pinned: !!post.pinned, content: post.content || '' };
+      cover: post.cover || '', ogImage: post.ogImage || '', category: post.category || '', series: post.series || '', seriesOrder: Number(post.seriesOrder) || 0, status: post.status || 'published',
+      pinned: !!post.pinned, protected: !!post.protected, enc: post.protected ? (post.enc || null) : null,
+      publishAt: post.publishAt || null, content: post.content || '' };
     if (idx >= 0) drafts[idx] = item; else drafts.push(item);
     localStorage.setItem('qingyu.drafts', JSON.stringify(drafts));
+    saveStaticRevision(item, reason || 'save');
   }
+  var OFFLINE_POSTS_KEY = 'qingyu.offlinePosts';
+  function readOfflineQueue() {
+    try {
+      var list = JSON.parse(localStorage.getItem(OFFLINE_POSTS_KEY) || '[]');
+      return Array.isArray(list) ? list.filter(function (item) { return item && item.post && item.post.id; }) : [];
+    } catch (e) { return []; }
+  }
+  function writeOfflineQueue(list) {
+    try {
+      var safe = (Array.isArray(list) ? list : []).slice(-30);
+      if (safe.length) localStorage.setItem(OFFLINE_POSTS_KEY, JSON.stringify(safe));
+      else localStorage.removeItem(OFFLINE_POSTS_KEY);
+    } catch (e) {}
+  }
+  function isNetworkFailure(err) {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
+    var status = Number(err && err.status) || 0;
+    if (status === 0 || status >= 500) return true;
+    return /Failed to fetch|NetworkError|Load failed|network|abort|timed out|HTTP 0/i.test(String((err && err.message) || err || ''));
+  }
+  function queueOfflinePost(post, isNew) {
+    var list = readOfflineQueue().filter(function (item) { return String(item.post.id) !== String(post.id); });
+    list.push({ post: post, isNew: !!isNew, queuedAt: Date.now() });
+    writeOfflineQueue(list);
+    saveStaticPost(post, 'offline');
+    try { window.dispatchEvent(new CustomEvent('qy:offline-queue', { detail: { count: list.length } })); } catch (e) {}
+    return list.length;
+  }
+  function mergeOfflinePosts(serverPosts) {
+    var map = {};
+    (Array.isArray(serverPosts) ? serverPosts : []).forEach(function (post) {
+      if (post && post.id) map[String(post.id)] = post;
+    });
+    readOfflineQueue().forEach(function (item) {
+      if (item && item.post && item.post.id) map[String(item.post.id)] = item.post;
+    });
+    return Object.keys(map).map(function (key) { return map[key]; });
+  }
+  async function flushOfflineQueue(silent) {
+    if (!cloudOn() || (typeof navigator !== 'undefined' && navigator.onLine === false)) return { synced: 0, remaining: readOfflineQueue().length };
+    var queue = readOfflineQueue();
+    if (!queue.length) return { synced: 0, remaining: 0 };
+    var remaining = [];
+    var synced = 0;
+    for (var i = 0; i < queue.length; i++) {
+      var item = queue[i];
+      try {
+        var r = await savePost(item.post, item.isNew);
+        if (!r || (!r.ok && !r.post)) throw new Error(t('admin.editor.saveFail'));
+        synced++;
+      } catch (e) {
+        if (item.isNew && Number(e && e.status) === 409) {
+          synced++;
+          continue;
+        }
+        remaining.push(item);
+        if (isNetworkFailure(e)) {
+          remaining = remaining.concat(queue.slice(i + 1));
+          break;
+        }
+      }
+    }
+    writeOfflineQueue(remaining);
+    if (synced && !silent) toast(t('admin.editor.syncedOffline'), 'ok');
+    return { synced: synced, remaining: remaining.length };
+  }
+
   async function savePost(post, isNew) {
     if (cloudOn()) {
       if (isNew) return await api('api/posts', { method: 'POST', body: JSON.stringify(post) });
@@ -207,6 +337,144 @@
     }
     return { ok: true, needExport: inBundle };
   }
+  function staticRevisionKey(id) { return 'qingyu.revisions.' + String(id || ''); }
+  function readStaticRevisions(id) {
+    try {
+      var arr = JSON.parse(localStorage.getItem(staticRevisionKey(id)) || '[]');
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) { return []; }
+  }
+  function saveStaticRevision(post, reason) {
+    if (!post || !post.id) return;
+    var list = readStaticRevisions(post.id);
+    var snapshot = Object.assign({}, post, {
+      revisionId: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+      reason: reason || 'save',
+      createdAt: Date.now()
+    });
+    var fingerprint = JSON.stringify([post.title, post.date, post.excerpt, post.content, post.cover, post.pinned, post.tags, post.status, post.publishAt]);
+    var last = list[0];
+    var lastFingerprint = last ? JSON.stringify([last.title, last.date, last.excerpt, last.content, last.cover, last.pinned, last.tags, last.status, last.publishAt]) : '';
+    if (lastFingerprint !== fingerprint) list.unshift(snapshot);
+    localStorage.setItem(staticRevisionKey(post.id), JSON.stringify(list.slice(0, 50)));
+  }
+  function revisionPostId(rev) { return rev && (rev.postId || rev.post_id || rev.id || ''); }
+  async function listPostRevisions(id) {
+    if (cloudOn()) {
+      var d = await api('api/posts/' + enc(id) + '/revisions');
+      return (d && d.revisions) || [];
+    }
+    return readStaticRevisions(id);
+  }
+  async function getPostRevision(id, revisionId) {
+    if (cloudOn()) {
+      var d = await api('api/posts/' + enc(id) + '/revisions/' + enc(revisionId));
+      return d && d.revision;
+    }
+    var list = readStaticRevisions(id);
+    return list.filter(function (r) { return String(r.revisionId) === String(revisionId); })[0] || null;
+  }
+  async function restorePostRevision(id, revisionId) {
+    if (cloudOn()) {
+      return await api('api/posts/' + enc(id) + '/revisions/' + enc(revisionId) + '/restore', { method: 'POST', body: '{}' });
+    }
+    var rev = await getPostRevision(id, revisionId);
+    if (!rev) return null;
+    var post = Object.assign({}, rev, { id: id });
+    delete post.revisionId;
+    delete post.createdAt;
+    delete post.reason;
+    saveStaticPost(post, 'restore');
+    if (Array.isArray(window.BLOG_POSTS)) {
+      var idx = -1;
+      for (var i = 0; i < window.BLOG_POSTS.length; i++) if (window.BLOG_POSTS[i] && window.BLOG_POSTS[i].id === id) { idx = i; break; }
+      if (idx >= 0) window.BLOG_POSTS[idx] = Object.assign({}, window.BLOG_POSTS[idx], post);
+      else window.BLOG_POSTS.push(post);
+    }
+    return { ok: true, post: post };
+  }
+  function revisionReasonLabel(reason) {
+    if (reason === 'create') return t('admin.revisions.reasonCreate');
+    if (reason === 'restore') return t('admin.revisions.reasonRestore');
+    return t('admin.revisions.reasonUpdate');
+  }
+  function lineDiff(oldText, newText) {
+    var oldLines = String(oldText || '').split(/\r?\n/);
+    var newLines = String(newText || '').split(/\r?\n/);
+    var n = oldLines.length, m = newLines.length;
+    if (n * m > 300000) {
+      return newLines.map(function (line) { return '+ ' + line; }).join('\n');
+    }
+    var dp = Array(n + 1);
+    for (var i = 0; i <= n; i++) { dp[i] = new Uint16Array(m + 1); }
+    for (i = n - 1; i >= 0; i--) {
+      for (var j = m - 1; j >= 0; j--) {
+        dp[i][j] = oldLines[i] === newLines[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+    var out = [], x = 0, y = 0;
+    while (x < n && y < m) {
+      if (oldLines[x] === newLines[y]) { out.push('  ' + newLines[y]); x++; y++; }
+      else if (dp[x + 1][y] >= dp[x][y + 1]) { out.push('- ' + oldLines[x]); x++; }
+      else { out.push('+ ' + newLines[y]); y++; }
+    }
+    while (x < n) out.push('- ' + oldLines[x++]);
+    while (y < m) out.push('+ ' + newLines[y++]);
+    return out.join('\n');
+  }
+  async function openRevisionHistory(content, route) {
+    if (!route.id) { toast(t('admin.revisions.newHint'), 'err'); return; }
+    var mask = document.createElement('div');
+    mask.className = 'ab-modal-mask';
+    mask.innerHTML = '<div class="ab-modal" style="max-width:980px;width:min(96vw,980px)"><h3>' + t('admin.revisions.title') + '</h3>' +
+      '<div style="display:grid;grid-template-columns:240px minmax(0,1fr);gap:12px;min-height:420px;max-height:70vh">' +
+      '<div id="abRevList" style="overflow:auto;border-right:1px solid var(--ab-border);padding-right:10px"><span class="ab-spin"></span></div>' +
+      '<div id="abRevDetail" style="overflow:auto"><p class="ab-muted">' + t('admin.revisions.pick') + '</p></div></div>' +
+      '<div class="ab-modal-actions"><button class="ab-btn ghost" data-act="cancel">' + t('confirm.cancel') + '</button></div></div>';
+    document.body.appendChild(mask);
+    mask.addEventListener('click', function (e) { if (e.target === mask || e.target.getAttribute('data-act') === 'cancel') mask.remove(); });
+    var listEl = mask.querySelector('#abRevList');
+    var detailEl = mask.querySelector('#abRevDetail');
+    try {
+      var revisions = await listPostRevisions(route.id);
+      if (!revisions.length) {
+        listEl.innerHTML = '<p class="ab-muted">' + t('admin.revisions.empty') + '</p>';
+        return;
+      }
+      listEl.innerHTML = revisions.map(function (r) {
+        return '<button type="button" class="ab-nav-item" data-rev="' + esc(String(r.id || r.revisionId)) + '" style="width:100%;text-align:left;margin-bottom:6px"><b>' + esc(fmtTimestamp(r.createdAt)) + '</b><br><span class="ab-muted">' + esc(revisionReasonLabel(r.reason)) + '</span></button>';
+      }).join('');
+      async function showRevision(revId) {
+        detailEl.innerHTML = '<span class="ab-spin"></span> ' + t('admin.revisions.loading');
+        try {
+          var rev = await getPostRevision(route.id, revId);
+          if (!rev) { detailEl.innerHTML = '<p class="ab-muted">' + t('admin.revisions.notFound') + '</p>'; return; }
+          var current = { title: content.querySelector('#abTitle').value, content: content.querySelector('#abBody').value };
+          var diff = lineDiff(rev.content || '', current.content || '');
+          detailEl.innerHTML = '<div class="ab-card" style="padding:12px;margin:0 0 12px"><b>' + esc(rev.title || t('admin.postList.noTitle')) + '</b><div class="ab-muted" style="font-size:12px;margin-top:6px">' + esc(fmtTimestamp(rev.createdAt)) + ' · ' + esc(revisionReasonLabel(rev.reason)) + '</div><div style="margin-top:12px"><button class="ab-btn primary sm" id="abRevRestore">' + icon('refresh', 13) + ' ' + t('admin.revisions.restore') + '</button></div></div>' +
+            '<div style="font-size:12px;margin-bottom:6px" class="ab-muted">' + t('admin.revisions.diff') + '</div><pre style="white-space:pre-wrap;word-break:break-word;background:var(--ab-hover);padding:12px;border-radius:8px;max-height:46vh;overflow:auto">' + esc(diff) + '</pre>';
+          detailEl.querySelector('#abRevRestore').addEventListener('click', function () {
+            confirmModal(t('admin.revisions.restore'), '<p class="ab-muted">' + t('admin.revisions.restoreConfirm') + '</p>', async function () {
+              try {
+                var result = await restorePostRevision(route.id, revId);
+                if (!result || !result.ok) throw new Error(t('admin.revisions.restoreFail'));
+                toast(t('admin.revisions.restored'), 'ok');
+                mask.remove();
+                await loadEditor(content, route.id);
+              } catch (e) { toast(t('admin.revisions.restoreFail') + (e.message || e), 'err'); }
+            }, t('admin.revisions.restore'));
+          });
+        } catch (e) { detailEl.innerHTML = '<p class="ab-muted">' + t('admin.revisions.loadFail') + esc(e.message || e) + '</p>'; }
+      }
+      listEl.querySelectorAll('[data-rev]').forEach(function (btn) {
+        btn.addEventListener('click', function () { showRevision(btn.getAttribute('data-rev')); });
+      });
+      showRevision(String(revisions[0].id || revisions[0].revisionId));
+    } catch (e) {
+      listEl.innerHTML = '<p class="ab-muted">' + t('admin.revisions.loadFail') + esc(e.message || e) + '</p>';
+    }
+  }
+
   function downloadPostsJs() {
     if (!window.buildPostsJs) { toast(t('admin.toast.exportNotSupported'), 'err'); return; }
     // posts.js
@@ -371,8 +639,10 @@
       { group: t('admin.sidebar.overview'), items: [{ key: 'dashboard', label: t('admin.sidebar.dashboard'), icon: 'gauge', href: '/admin' }] },
       { group: t('admin.sidebar.postManage'), items: [
         { key: 'posts', label: t('admin.sidebar.allPosts'), icon: 'list', href: '/admin/posts' },
+        { key: 'analytics', label: t('admin.sidebar.analytics'), icon: 'gauge', href: '/admin/analytics' },
         { key: 'write', label: t('admin.sidebar.writeNew'), icon: 'pen', href: '/admin/posts/new' },
-        { key: 'tags', label: t('admin.sidebar.tagManage'), icon: 'tag', href: '/admin/tags' }
+        { key: 'tags', label: t('admin.sidebar.tagManage'), icon: 'tag', href: '/admin/tags' },
+        { key: 'series', label: t('admin.sidebar.seriesManage'), icon: 'list', href: '/admin/series' }
       ] },
       { group: t('admin.sidebar.commentManage'), items: [
         { key: 'comments', label: t('admin.sidebar.allComments'), icon: 'quote', href: '/admin/comments' },
@@ -381,6 +651,9 @@
       { group: t('admin.sidebar.contentSettings'), items: [
         { key: 'media', label: t('admin.sidebar.media'), icon: 'image', href: '/admin/media' },
         { key: 'music', label: t('admin.sidebar.musicManage'), icon: 'music', href: '/admin/music' },
+        { key: 'subscribers', label: t('admin.sidebar.subscribers'), icon: 'send', href: '/admin/subscribers' },
+        { key: 'backup', label: t('admin.sidebar.backups'), icon: 'save', href: '/admin/backups' },
+        { key: 'transfer', label: t('admin.sidebar.importExport'), icon: 'download', href: '/admin/import-export' },
         { key: 'settings', label: t('admin.sidebar.settings'), icon: 'sliders', href: '/admin/settings' }
       ] }
     ];
@@ -522,11 +795,16 @@
     if (m) return { key: 'write', page: 'editor', id: decodeURIComponent(m[1]), isNew: false };
     if (path === '/admin' || path === '/admin/') return { key: 'dashboard', page: 'dashboard' };
     if (path === '/admin/posts') return { key: 'posts', page: 'posts' };
+    if (path === '/admin/analytics') return { key: 'analytics', page: 'analytics' };
     if (path === '/admin/tags') return { key: 'tags', page: 'tags' };
+    if (path === '/admin/series') return { key: 'series', page: 'series' };
     if (path === '/admin/comments') return { key: 'comments', page: 'comments', filter: 'all' };
     if (path === '/admin/comments/pending') return { key: 'comments-pending', page: 'comments', filter: 'pending' };
     if (path === '/admin/media') return { key: 'media', page: 'media' };
     if (path === '/admin/music') return { key: 'music', page: 'music' };
+    if (path === '/admin/subscribers') return { key: 'subscribers', page: 'subscribers' };
+    if (path === '/admin/backups') return { key: 'backup', page: 'backup' };
+    if (path === '/admin/import-export') return { key: 'transfer', page: 'transfer' };
     if (path === '/admin/settings') return { key: 'settings', page: 'settings' };
     return { key: 'dashboard', page: 'dashboard' };
   }
@@ -668,11 +946,17 @@
     if (_feedTimer) { clearInterval(_feedTimer); _feedTimer = null; } // 离开仪表盘时停止评论自动滚动
     if (route.page === 'dashboard') return pageDashboard(content);
     if (route.page === 'posts') return pagePosts(content);
+    if (route.page === 'analytics') return pageAnalytics(content);
+    if (route.page === 'analytics') return pageAnalytics(content);
     if (route.page === 'editor') return pageEditor(content, route);
     if (route.page === 'tags') return pageTags(content);
+    if (route.page === 'series') return pageSeries(content);
     if (route.page === 'comments') return pageComments(content, route.filter);
     if (route.page === 'media') return pageMedia(content);
     if (route.page === 'music') return pageMusic(content);
+    if (route.page === 'subscribers') return pageSubscribers(content);
+    if (route.page === 'backup') return pageBackups(content);
+    if (route.page === 'transfer') return pageImportExport(content);
     if (route.page === 'settings') return pageSettings(content);
   }
 
@@ -684,6 +968,7 @@
         '<div class="ab-card"><div class="ab-section-title">' + icon('eye', 16) + ' ' + t('admin.dashboard.visitTrend') + '</div><div id="abTrendViews"></div></div>' +
         '<div class="ab-card"><div class="ab-section-title">' + icon('quote', 16) + ' ' + t('admin.dashboard.commentTrend') + '</div><div id="abTrendCmt"></div></div>' +
       '</div>' +
+      '<div class="ab-card" id="abStorageCard"><div class="ab-section-title">' + icon('cloud', 16) + ' ' + t('admin.dashboard.storageTitle') + '</div><div id="abStorageBody"><span class="ab-spin"></span> ' + t('site.loading') + '</div></div>' +
       '<div class="ab-grid cols-2">' +
         '<div class="ab-card"><div class="ab-section-title">' + icon('doc', 16) + ' ' + t('admin.dashboard.latestPosts') + '</div><div class="ab-feed" id="abRecentPosts"></div></div>' +
         '<div class="ab-card"><div class="ab-section-title">' + icon('quote', 16) + ' ' + t('admin.dashboard.latestComments') + '</div><div class="ab-feed" id="abRecentCmt"></div></div>' +
@@ -696,8 +981,9 @@
     var posts = [];
     try { posts = await listPosts(); } catch (e) {}
     var total = posts.length;
-    var published = posts.filter(function (p) { return (p.status || 'published') !== 'draft'; }).length;
+    var published = posts.filter(function (p) { return (p.status || 'published') === 'published'; }).length;
     var drafts = posts.filter(function (p) { return (p.status || 'published') === 'draft'; }).length;
+    var scheduled = posts.filter(function (p) { return (p.status || 'published') === 'scheduled'; }).length;
 
     var commentsAll = [], pending = 0;
     if (cloudOn()) {
@@ -709,6 +995,7 @@
     var stats = [
       { label: t('admin.dashboard.totalPosts'), value: total, icon: 'doc' },
       { label: t('admin.dashboard.published'), value: published, icon: 'check' },
+      { label: t('admin.dashboard.scheduled'), value: scheduled, icon: 'clock' },
       { label: t('admin.dashboard.drafts'), value: drafts, icon: 'pen' },
       { label: t('admin.dashboard.pinned'), value: pinnedCount, icon: 'pin' },
       { label: t('admin.dashboard.totalComments'), value: cloudOn() ? commentsAll.length : '—', icon: 'quote' },
@@ -754,6 +1041,35 @@
       content.querySelector('#abTrendViews').innerHTML = '<div class="ab-empty"><p>' + t('admin.dashboard.cloudOnly') + '</p></div>';
       content.querySelector('#abTrendCmt').innerHTML = '<div class="ab-empty"><p>' + t('admin.dashboard.cloudOnly') + '</p></div>';
     }
+
+    loadStorageOverview(content);
+  }
+
+  /** 存储与订阅概览：媒体占用 / 音乐 / 订阅者 / 备份（异步加载，不阻塞首屏） */
+  async function loadStorageOverview(content) {
+    var box = content.querySelector('#abStorageBody');
+    if (!box) return;
+    if (!cloudOn()) {
+      box.innerHTML = '<div class="ab-empty"><p>' + t('admin.dashboard.cloudOnly') + '</p></div>';
+      return;
+    }
+    var media = [], music = [], subs = { total: 0, active: 0 }, backups = [];
+    await Promise.all([
+      api('api/media').then(function (d) { media = (d && d.media) || []; }).catch(function () {}),
+      api('api/music').then(function (d) { music = (d && d.music) || []; }).catch(function () {}),
+      api('api/admin/subscribers').then(function (d) { subs = (d && d.counts) || subs; }).catch(function () {}),
+      api('api/admin/backups').then(function (d) { backups = (d && d.backups) || []; }).catch(function () {})
+    ]);
+    var mediaSize = media.reduce(function (n, m) { return n + (Number(m.size) || 0); }, 0);
+    var items = [
+      { label: t('admin.dashboard.sMedia'), value: media.length, sub: fmtSize(mediaSize), icon: 'image' },
+      { label: t('admin.dashboard.sMusic'), value: music.length, sub: '', icon: 'music' },
+      { label: t('admin.dashboard.sSubs'), value: subs.total || 0, sub: t('admin.dashboard.sActive', { n: subs.active || 0 }), icon: 'send' },
+      { label: t('admin.dashboard.sBackups'), value: backups.length, sub: backups.length ? t('admin.dashboard.sLatest', { time: fmtTimestamp(backups[0].createdAt) }) : '', icon: 'save' }
+    ];
+    box.innerHTML = '<div class="ab-grid cols-4" style="margin:0">' + items.map(function (x) {
+      return '<div class="ab-card ab-stat" style="margin:0"><div class="ab-stat-label">' + icon(x.icon, 16) + esc(x.label) + '</div><div class="ab-stat-value">' + esc(String(x.value)) + '</div>' + (x.sub ? '<div class="ab-muted" style="font-size:12px">' + esc(x.sub) + '</div>' : '') + '</div>';
+    }).join('') + '</div>';
   }
 
   var _chartData = {}; // metric → days[]，供交互浮层读取
@@ -873,6 +1189,118 @@
     });
   }
 
+  /* ====================== 文章数据分析 ====================== */
+  function localPostAnalytics(posts) {
+    var items = (posts || []).map(function (p) {
+      var views = 0, likes = 0, comments = 0;
+      try {
+        var raw = localStorage.getItem('qingyu.stats.' + p.id);
+        if (raw) { var st = JSON.parse(raw); views = Number(st.views) || 0; likes = Number(st.likes) || 0; }
+      } catch (e) {}
+      try {
+        var cr = localStorage.getItem('qingyu.comments.' + p.id);
+        if (cr) { var arr = JSON.parse(cr); comments = Array.isArray(arr) ? arr.length : 0; }
+      } catch (e) {}
+      return Object.assign({}, p, { views: views, likes: likes, comments: comments, score: views + likes * 3 + comments * 5 });
+    });
+    items.sort(function (a, b) { return b.score - a.score || b.views - a.views; });
+    var summary = items.reduce(function (a, p) { a.views += p.views; a.likes += p.likes; a.comments += p.comments; return a; }, { views: 0, likes: 0, comments: 0, posts: items.length });
+    return { summary: summary, items: items };
+  }
+  function renderAnalyticsSummary(summary, items) {
+    var box = document.querySelector('#abAnalyticsSummary');
+    if (!box) return;
+    var top = items && items[0];
+    var cards = [
+      { label: t('admin.analytics.totalViews'), value: Number(summary && summary.views) || 0, icon: 'eye' },
+      { label: t('admin.analytics.totalLikes'), value: Number(summary && summary.likes) || 0, icon: 'heart' },
+      { label: t('admin.analytics.totalComments'), value: Number(summary && summary.comments) || 0, icon: 'quote' },
+      { label: t('admin.analytics.topPost'), value: top ? (top.title || t('admin.dashboard.noTitle')) : '—', icon: 'gauge', small: true }
+    ];
+    box.innerHTML = cards.map(function (c) {
+      return '<div class="ab-stat"><span class="ab-stat-ico">' + icon(c.icon, 17) + '</span><span class="ab-stat-num' + (c.small ? ' small' : '') + '">' + esc(String(c.value)) + '</span><span class="ab-stat-label">' + esc(c.label) + '</span></div>';
+    }).join('');
+  }
+  function analyticsSparkline(trend) {
+    var points = Array.isArray(trend) ? trend : [];
+    if (points.length < 2) return '<span class="ab-muted">—</span>';
+    var values = points.map(function (p) { return Number(p.views) || 0; });
+    var max = Math.max.apply(Math, values.concat([1]));
+    var w = 96, h = 26;
+    var coords = values.map(function (v, i) {
+      var x = (i / (values.length - 1)) * w;
+      var y = h - (v / max) * (h - 4) - 2;
+      return x.toFixed(1) + ',' + y.toFixed(1);
+    }).join(' ');
+    return '<svg class="ab-sparkline" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" aria-hidden="true"><polyline points="' + coords + '"></polyline></svg>';
+  }
+  function exportAnalyticsCsv(content) {
+    var items = (content && content.__analyticsItems) || [];
+    if (!items.length) return;
+    var header = ['id', 'title', 'status', 'date', 'views', 'likes', 'comments', 'score'];
+    var lines = [header.join(',')];
+    items.forEach(function (p) {
+      lines.push(header.map(function (key) {
+        var val = p[key] == null ? '' : String(p[key]);
+        return '"' + val.replace(/"/g, '""') + '"';
+      }).join(','));
+    });
+    var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'post-analytics-' + new Date().toISOString().slice(0, 10) + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); if (a.remove) a.remove(); }, 0);
+    toast(t('admin.analytics.exported'), 'ok');
+  }
+  function renderAnalyticsTable(items) {
+    var body = document.querySelector('#abAnalyticsBody');
+    if (!body) return;
+    if (!items || !items.length) {
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.analytics.empty') + '</td></tr>';
+      return;
+    }
+    body.innerHTML = items.map(function (p) {
+      var status = p.status === 'draft' ? t('admin.dashboard.drafts') : (p.status === 'scheduled' ? t('admin.dashboard.scheduled') : '');
+      return '<tr><td><a class="ab-post-title" data-link="/admin/posts/' + enc(p.id) + '/edit">' + esc(p.title || t('admin.dashboard.noTitle')) + '</a>' + (status ? ' <span class="ab-chip">' + esc(status) + '</span>' : '') + '</td>'
+        + '<td>' + (Number(p.views) || 0) + '</td><td>' + (Number(p.likes) || 0) + '</td><td>' + (Number(p.comments) || 0) + '</td><td><b class="ab-analytics-score">' + (Number(p.score) || 0) + '</b></td><td class="ab-td-trend">' + analyticsSparkline(p.trend) + '</td></tr>';
+    }).join('');
+    body.querySelectorAll('[data-link]').forEach(function (a) {
+      a.addEventListener('click', function (e) { e.preventDefault(); go(a.getAttribute('data-link')); });
+    });
+  }
+  async function loadAnalytics(content, range) {
+    var body = content.querySelector('#abAnalyticsBody');
+    if (body) body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
+    var data = null;
+    if (cloudOn()) {
+      try { data = await api('api/admin/post-analytics?range=' + encodeURIComponent(range || 'all')); } catch (e) {}
+    }
+    if (!data) {
+      try { data = localPostAnalytics(await listPosts()); } catch (e) { data = { summary: {}, items: [] }; }
+    }
+    content.__analyticsItems = data.items || [];
+    renderAnalyticsSummary(data.summary || {}, data.items || []);
+    renderAnalyticsTable(data.items || []);
+  }
+  function pageAnalytics(content) {
+    content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.analytics.title') + '</h1><p class="ab-page-sub">' + t('admin.analytics.desc') + '</p></div></div>'
+      + (cloudOn() ? '<div class="ab-analytics-tabs"><button class="ab-btn sm active" data-analytics-range="all">' + t('admin.analytics.all') + '</button><button class="ab-btn sm" data-analytics-range="30">' + t('admin.analytics.last30') + '</button><button class="ab-btn sm" data-analytics-range="7">' + t('admin.analytics.last7') + '</button></div>' : '')
+      + '<div class="ab-row" style="justify-content:flex-end;margin-bottom:10px"><button class="ab-btn sm" id="abAnalyticsExport">' + icon('download', 13) + ' ' + t('admin.analytics.exportCsv') + '</button></div>'
+      + '<div class="ab-grid cols-4" id="abAnalyticsSummary"></div>'
+      + '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.analytics.colTitle') + '</th><th>' + t('admin.analytics.colViews') + '</th><th>' + t('admin.analytics.colLikes') + '</th><th>' + t('admin.analytics.colComments') + '</th><th>' + t('admin.analytics.colScore') + '</th><th>' + t('admin.analytics.colTrend') + '</th></tr></thead><tbody id="abAnalyticsBody"></tbody></table></div></div>';
+    var exportBtn = content.querySelector('#abAnalyticsExport');
+    if (exportBtn) exportBtn.addEventListener('click', function () { exportAnalyticsCsv(content); });
+    content.querySelectorAll('[data-analytics-range]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        content.querySelectorAll('[data-analytics-range]').forEach(function (b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        loadAnalytics(content, btn.getAttribute('data-analytics-range'));
+      });
+    });
+    loadAnalytics(content, 'all');
+  }
   /* ====================== 文章列表 ====================== */
   function pagePosts(content) {
     content.innerHTML =
@@ -880,13 +1308,21 @@
         '<button class="ab-btn primary" data-link="/admin/posts/new">' + icon('pen', 15) + ' ' + t('admin.sidebar.writeNew') + '</button></div>' +
       '<div class="ab-toolbar">' +
         '<div class="ab-search"><input class="ab-input" id="abPostKw" placeholder="' + t('admin.postList.search') + '"></div>' +
-        '<select class="ab-select" id="abPostStatus" style="max-width:140px"><option value="all">' + t('admin.postList.allStatus') + '</option><option value="published">' + t('admin.dashboard.published') + '</option><option value="draft">' + t('admin.dashboard.drafts') + '</option></select>' +
+        '<select class="ab-select" id="abPostStatus" style="max-width:160px"><option value="all">' + t('admin.postList.allStatus') + '</option><option value="published">' + t('admin.dashboard.published') + '</option><option value="scheduled">' + t('admin.dashboard.scheduled') + '</option><option value="draft">' + t('admin.dashboard.drafts') + '</option></select>' +
       '</div>' +
+      '<div class="ab-bulk" id="abPostBulk" style="display:none"><span class="ab-muted" id="abPostSelInfo"></span>' +
+        '<button class="ab-btn sm" id="abPostPinOn">' + icon('pin', 13) + ' ' + t('admin.postList.bulkPinOn') + '</button>' +
+        '<button class="ab-btn sm" id="abPostPinOff">' + icon('pin', 13) + ' ' + t('admin.postList.bulkPinOff') + '</button>' +
+        '<button class="ab-btn sm danger" id="abPostDel">' + icon('trash', 13) + ' ' + t('admin.postList.bulkDelete') + '</button></div>' +
       '<div class="ab-table-wrap"><table class="ab-table"><thead><tr>' +
+        '<th class="col-check"><input type="checkbox" id="abPostAll" aria-label="' + t('admin.postList.selectPage') + '"></th>' +
         '<th>' + t('admin.postList.colTitle') + '</th><th>' + t('admin.postList.colTags') + '</th><th>' + t('admin.postList.colDate') + '</th><th>' + t('admin.postList.colStatus') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th>' +
       '</tr></thead><tbody id="abPostBody"></tbody></table></div>' +
       '<div class="ab-pagination" id="abPostPage"></div>';
 
+    content.querySelector('#abPostPinOn').addEventListener('click', function () { bulkPinPosts(content, true); });
+    content.querySelector('#abPostPinOff').addEventListener('click', function () { bulkPinPosts(content, false); });
+    content.querySelector('#abPostDel').addEventListener('click', function () { bulkDeletePosts(content); });
     bindPosts(content);
     loadPosts(content, 1);
     // 绑定内容区内的导航链接（如「写新文章」按钮），bindShell 仅绑定挂载时已有的元素
@@ -901,15 +1337,66 @@
     function refilter() { loadPosts(content, 1); }
     kw.addEventListener('input', debounce(refilter, 250));
     st.addEventListener('change', refilter);
+    var all = content.querySelector('#abPostAll');
+    if (all) all.addEventListener('change', function () {
+      var on = all.checked;
+      content.querySelectorAll('#abPostBody [data-pick]').forEach(function (cb) {
+        var id = dec(cb.getAttribute('data-pick'));
+        if (on) postSel[id] = true; else delete postSel[id];
+        cb.checked = on;
+      });
+      syncPostSelection(content);
+    });
+  }
+  /** 文章列表多选状态（跨页保留，按 id 记录） */
+  var postSel = {};
+  function syncPostSelection(content) {
+    var ids = Object.keys(postSel);
+    var bar = content.querySelector('#abPostBulk');
+    var info = content.querySelector('#abPostSelInfo');
+    if (bar) bar.style.display = ids.length ? 'flex' : 'none';
+    if (info) info.textContent = t('admin.postList.bulkSelected', { n: ids.length });
+  }
+  async function bulkPinPosts(content, pinned) {
+    var ids = Object.keys(postSel);
+    if (!ids.length) return;
+    var ok = 0;
+    for (var i = 0; i < ids.length; i++) {
+      try {
+        var post = await getPost(ids[i]);
+        if (!post) continue;
+        post.pinned = pinned;
+        if (cloudOn()) await api('api/posts/' + enc(ids[i]), { method: 'PUT', body: JSON.stringify(post) });
+        else saveStaticPost(post);
+        ok++;
+      } catch (e) {}
+    }
+    if (!cloudOn() && ok) downloadPostsJs();
+    toast(pinned ? t('admin.postList.bulkPinned', { n: ok }) : t('admin.postList.bulkUnpinned', { n: ok }), ok ? 'ok' : 'err');
+    postSel = {};
+    loadPosts(content, 1);
+  }
+  async function bulkDeletePosts(content) {
+    var ids = Object.keys(postSel);
+    if (!ids.length) return;
+    confirmModal(t('admin.postList.bulkDelete'), '<p class="ab-muted">' + t('admin.postList.bulkDeleteConfirm', { n: ids.length }) + '</p>', async function () {
+      var ok = 0;
+      for (var i = 0; i < ids.length; i++) {
+        try { await deletePost(ids[i]); if (window.syncDeletedPost) window.syncDeletedPost(ids[i]); ok++; } catch (e) {}
+      }
+      toast(t('admin.postList.bulkDeleted', { n: ok }), ok ? 'ok' : 'err');
+      postSel = {};
+      loadPosts(content, 1);
+    }, t('admin.comments.delete'));
   }
   function debounce(fn, ms) { var t; return function () { clearTimeout(t); t = setTimeout(fn, ms); }; }
 
   async function loadPosts(content, page, silent) {
     var body = content.querySelector('#abPostBody');
     // silent：删除/审核后的静默校准刷新，不打断当前视图（不闪加载行）
-    if (!silent) body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
+    if (!silent) body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
     var posts = [];
-    try { posts = await listPosts(); } catch (e) { body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; return; }
+    try { posts = await listPosts(); } catch (e) { body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; return; }
 
     var kw = content.querySelector('#abPostKw').value.trim().toLowerCase();
     var st = content.querySelector('#abPostStatus').value;
@@ -925,7 +1412,7 @@
     filtered.sort(function (a, b) { return (b.date || '').localeCompare(a.date || ''); });
 
     if (!filtered.length) {
-      body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.postList.noMatch') + '</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.postList.noMatch') + '</td></tr>';
       content.querySelector('#abPostPage').innerHTML = '';
       return;
     }
@@ -935,12 +1422,15 @@
     body.innerHTML = slice.map(function (p) {
       var id = p.id;
       var statusBadge = '';
-      if (p.pinned) statusBadge = '<span class="ab-status published">' + icon('pin', 11) + ' ' + t('admin.postList.pin') + '</span>';
-      else statusBadge = '<span class="ab-status ' + ((p.status || 'published') === 'draft' ? 'draft' : 'published') + '">' + ((p.status || 'published') === 'draft' ? t('admin.dashboard.drafts') : t('admin.dashboard.published')) + '</span>';
-      return '<tr>' +
-        '<td><a class="ab-post-title" data-link="/admin/posts/' + enc(id) + '/edit">' + esc(p.title || t('admin.dashboard.noTitle')) + '</a></td>' +
+      var postStatus = p.status || 'published';
+      if (postStatus === 'scheduled') statusBadge = '<span class="ab-status scheduled">' + icon('clock', 11) + ' ' + t('admin.dashboard.scheduled') + (p.publishAt ? ' · ' + esc(fmtTimestamp(p.publishAt)) : '') + '</span>';
+      else if (p.pinned) statusBadge = '<span class="ab-status published">' + icon('pin', 11) + ' ' + t('admin.postList.pin') + '</span>';
+      else statusBadge = '<span class="ab-status ' + (postStatus === 'draft' ? 'draft' : 'published') + '">' + (postStatus === 'draft' ? t('admin.dashboard.drafts') : t('admin.dashboard.published')) + '</span>';
+      return '<tr' + (postSel[id] ? ' class="selected"' : '') + '>' +
+        '<td class="col-check"><input type="checkbox" data-pick="' + enc(id) + '"' + (postSel[id] ? ' checked' : '') + ' aria-label="' + t('admin.postList.selectPage') + '"></td>' +
+        '<td><a class="ab-post-title" data-link="/admin/posts/' + enc(id) + '/edit">' + esc(p.title || t('admin.dashboard.noTitle')) + '</a>' + (p.series ? ' <span class="ab-chip">' + icon('list', 11) + ' ' + esc(p.series) + (p.seriesOrder ? ' #' + esc(String(p.seriesOrder)) : '') + '</span>' : '') + '</td>' +
         '<td class="ab-td-tags">' + (p.tags && p.tags.length ? '<div class="ab-tag-row">' + p.tags.map(function (t) { return '<span class="ab-chip">' + esc(t) + '</span>'; }).join('') + '</div>' : '<span class="ab-muted">—</span>') + '</td>' +
-        '<td class="ab-td-date">' + esc(fmtDate(p.date)) + '</td>' +
+        '<td class="ab-td-date">' + esc(fmtPostDate(p.date)) + '</td>' +
         '<td class="ab-td-status">' + statusBadge + '</td>' +
         '<td class="col-actions">' +
           '<button class="ab-btn sm" data-edit="' + enc(id) + '">' + icon('pen', 13) + ' ' + t('admin.postList.edit') + '</button> ' +
@@ -995,6 +1485,22 @@
       }, t('admin.comments.delete'));
     }); });
 
+    body.querySelectorAll('[data-pick]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var id = dec(cb.getAttribute('data-pick'));
+        if (cb.checked) postSel[id] = true; else delete postSel[id];
+        var card = cb.closest('tr');
+        if (card) card.classList.toggle('selected', cb.checked);
+        var allBox = content.querySelector('#abPostAll');
+        var boxes = body.querySelectorAll('[data-pick]');
+        if (allBox) allBox.checked = boxes.length > 0 && Array.prototype.every.call(boxes, function (x) { return x.checked; });
+        syncPostSelection(content);
+      });
+    });
+    var allBox0 = content.querySelector('#abPostAll');
+    if (allBox0) allBox0.checked = false;
+    syncPostSelection(content);
+
     var pg = content.querySelector('#abPostPage');
     var html = '';
     if (page > 1) html += '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>';
@@ -1005,6 +1511,498 @@
   }
   function enc(s) { return encodeURIComponent(s); }
   function dec(s) { try { return decodeURIComponent(s); } catch (e) { return s; } }
+
+  /* ====================== 文章导入 / 导出 ====================== */
+  function transferAnchorDownload(name, blob) {
+    var a = document.createElement('a');
+    var url = URL.createObjectURL(blob);
+    a.href = url;
+    a.download = name;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () {
+      try { if (a.parentNode) a.parentNode.removeChild(a); } catch (e) {}
+      try { URL.revokeObjectURL(url); } catch (e) {}
+    }, 1000);
+  }
+  function transferDownload(name, blob) {
+    // 支持 File System Access API 的浏览器优先弹出“另存为”，用户能明确选择文件位置；
+    // 不支持、被取消或权限受限时回退到浏览器默认下载目录。
+    if (typeof window.showSaveFilePicker === 'function') {
+      try {
+        window.showSaveFilePicker({ suggestedName: name }).then(function (handle) {
+          return handle.createWritable().then(function (writable) {
+            return writable.write(blob).then(function () { return writable.close(); });
+          });
+        }).catch(function (err) {
+          if (!err || err.name !== 'AbortError') transferAnchorDownload(name, blob);
+        });
+        return;
+      } catch (e) { transferAnchorDownload(name, blob); return; }
+    }
+    transferAnchorDownload(name, blob);
+  }
+  function transferDownloadText(name, text, type) {
+    transferDownload(name, new Blob([String(text || '')], { type: type || 'text/plain;charset=utf-8' }));
+  }
+  function transferStamp() {
+    var d = new Date();
+    function p(n) { return String(n).padStart(2, '0'); }
+    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
+  }
+  function transferSlug(value) {
+    return String(value || '').toLowerCase()
+      .replace(/[^\w\u4e00-\u9fa5-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 80);
+  }
+  function transferTags(value) {
+    if (Array.isArray(value)) return value.map(function (v) { return String(v).trim(); }).filter(Boolean);
+    var raw = String(value == null ? '' : value).trim();
+    if (!raw) return [];
+    if (raw.charAt(0) === '[') {
+      try {
+        var arr = JSON.parse(raw);
+        if (Array.isArray(arr)) return transferTags(arr);
+      } catch (e) {}
+    }
+    return raw.split(/[,，、]/).map(function (v) { return v.trim(); }).filter(Boolean);
+  }
+  function transferPostMarkdown(post) {
+    var lines = ['---'];
+    var stringKeys = ['id', 'title', 'date', 'excerpt', 'cover', 'og_image', 'category', 'series'];
+    stringKeys.forEach(function (key) {
+      var value = String(post[key] == null ? '' : post[key]);
+      if (value !== '') lines.push(key + ': ' + JSON.stringify(value));
+    });
+    lines.push('tags: ' + JSON.stringify(post.tags || []));
+    lines.push('series_order: ' + JSON.stringify(Number(post.seriesOrder) || 0));
+    lines.push('pinned: ' + (post.pinned ? 'true' : 'false'));
+    lines.push('status: ' + JSON.stringify(post.status === 'draft' ? 'draft' : (post.status === 'scheduled' ? 'scheduled' : 'published')));
+    if (post.publishAt) lines.push('publish_at: ' + JSON.stringify(new Date(Number(post.publishAt)).toISOString()));
+    if (post.protected) lines.push('protected: true');
+    if (post.enc) lines.push('enc: ' + JSON.stringify(post.enc));
+    lines.push('---', '');
+    return lines.join('\n') + String(post.content || '').replace(/\s*$/, '') + '\n';
+  }
+  function transferScalar(raw) {
+    var value = String(raw == null ? '' : raw).trim();
+    if (!value) return '';
+    var first = value.charAt(0);
+    if (first === '"' || first === '[' || first === '{') {
+      try { return JSON.parse(value); } catch (e) {}
+    }
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    if (value === 'null') return null;
+    if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
+    return value;
+  }
+  function transferParseMarkdown(text, filename) {
+    var src = String(text || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+    var meta = {};
+    var body = src;
+    if (src.slice(0, 3) === '---') {
+      var end = src.indexOf('\n---', 3);
+      if (end >= 0) {
+        var block = src.slice(4, end);
+        body = src.slice(end + 4).replace(/^\n/, '');
+        block.split('\n').forEach(function (line) {
+          var m = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(line);
+          if (m) meta[m[1].toLowerCase()] = transferScalar(m[2]);
+        });
+      }
+    }
+    var base = String(filename || '').replace(/^.*[\\/]/, '').replace(/\.(md|markdown)$/i, '');
+    var title = String(meta.title == null ? base : meta.title).trim();
+    var id = transferSlug(meta.id || title || base || ('post-' + Date.now().toString(36)));
+    var enc = meta.enc;
+    if (typeof enc === 'string' && enc) {
+      try { enc = JSON.parse(enc); } catch (e) { enc = null; }
+    }
+    var isProtected = !!(meta.protected && enc);
+    return normalizeImportedPost({
+      id: id,
+      title: title || base || t('admin.postList.noTitle'),
+      date: meta.date || new Date().toISOString().slice(0, 10),
+      tags: transferTags(meta.tags),
+      excerpt: meta.excerpt || '',
+      cover: meta.cover || '',
+      ogImage: meta.og_image || '',
+      category: meta.category || '',
+      series: meta.series || '',
+      seriesOrder: Number(meta.series_order) || 0,
+      status: meta.status,
+      publishAt: meta.publish_at ? Date.parse(String(meta.publish_at)) : null,
+      pinned: meta.pinned,
+      protected: isProtected,
+      enc: isProtected ? enc : null,
+      content: body.replace(/^\n+|\n+$/g, '')
+    }, base);
+  }
+  function transferParseJson(text) {
+    var data = JSON.parse(String(text || ''));
+    var raw = [];
+    if (Array.isArray(data)) raw = data;
+    else if (data && Array.isArray(data.posts)) raw = data.posts;
+    else if (data && data.post && typeof data.post === 'object') raw = [data.post];
+    else if (data && typeof data === 'object') raw = [data];
+    return raw.map(function (p) { return normalizeImportedPost(p, ''); }).filter(Boolean);
+  }
+  function normalizeImportedPost(post, fallbackId) {
+    if (!post || typeof post !== 'object') return null;
+    var title = String(post.title == null ? '' : post.title).trim();
+    var id = transferSlug(post.id || title || fallbackId || ('post-' + Date.now().toString(36)));
+    if (!id) return null;
+    if (!title) title = String(fallbackId || id).trim() || t('admin.postList.noTitle');
+    var enc = post.enc;
+    if (typeof enc === 'string' && enc) {
+      try { enc = JSON.parse(enc); } catch (e) { enc = null; }
+    }
+    var isProtected = !!(post.protected && enc);
+    var postStatus = post.status === 'draft' ? 'draft' : (post.status === 'scheduled' ? 'scheduled' : 'published');
+    var publishAtRaw = post.publishAt != null ? post.publishAt : post.publish_at;
+    var publishAt = Number(publishAtRaw) || (publishAtRaw ? Date.parse(String(publishAtRaw)) : null);
+    if (!Number.isFinite(publishAt) || publishAt <= 0) publishAt = null;
+    return {
+      id: id,
+      title: title,
+      date: String(post.date || new Date().toISOString().slice(0, 10)),
+      tags: transferTags(post.tags),
+      excerpt: String(post.excerpt || ''),
+      cover: String(post.cover || ''),
+      ogImage: String(post.ogImage || post.og_image || ''),
+      category: String(post.category || ''),
+      series: String(post.series || ''),
+      seriesOrder: Math.max(0, Math.floor(Number(post.seriesOrder || post.series_order) || 0)),
+      status: postStatus,
+      publishAt: postStatus === 'scheduled' ? publishAt : null,
+      pinned: !!post.pinned,
+      protected: isProtected,
+      enc: isProtected ? enc : null,
+      content: String(post.content || '')
+    };
+  }
+  function transferBackupJson(posts) {
+    return JSON.stringify({
+      format: 'qingyu-blog-posts',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      posts: posts || []
+    }, null, 2);
+  }
+  var _zipCrcTable = null;
+  function transferCrc32(bytes) {
+    if (!_zipCrcTable) {
+      _zipCrcTable = [];
+      for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        _zipCrcTable[n] = c >>> 0;
+      }
+    }
+    var crc = 0xFFFFFFFF;
+    for (var i = 0; i < bytes.length; i++) crc = _zipCrcTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+  function transferU16(n) { return [n & 0xFF, (n >>> 8) & 0xFF]; }
+  function transferU32(n) { return [n & 0xFF, (n >>> 8) & 0xFF, (n >>> 16) & 0xFF, (n >>> 24) & 0xFF]; }
+  function transferBytes(text) {
+    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(String(text || ''));
+    var out = [];
+    var s = unescape(encodeURIComponent(String(text || '')));
+    for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i));
+    return new Uint8Array(out);
+  }
+  function transferConcat(parts) {
+    var len = 0;
+    parts.forEach(function (p) { len += p.length; });
+    var out = new Uint8Array(len), offset = 0;
+    parts.forEach(function (p) { out.set(p, offset); offset += p.length; });
+    return out;
+  }
+  function transferDosTime(date) {
+    var d = date || new Date();
+    var year = Math.max(1980, d.getFullYear());
+    return {
+      time: (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2),
+      date: ((year - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()
+    };
+  }
+  function transferZip(files) {
+    var local = [], central = [], offset = 0;
+    var dt = transferDosTime(new Date());
+    (files || []).forEach(function (file) {
+      var name = transferBytes(file.name);
+      var data = transferBytes(file.text || '');
+      var crc = transferCrc32(data);
+      var localHead = transferConcat([
+        new Uint8Array([0x50, 0x4B, 0x03, 0x04]), new Uint8Array(transferU16(20)),
+        new Uint8Array(transferU16(0x0800)), new Uint8Array(transferU16(0)),
+        new Uint8Array(transferU16(dt.time)), new Uint8Array(transferU16(dt.date)),
+        new Uint8Array(transferU32(crc)), new Uint8Array(transferU32(data.length)),
+        new Uint8Array(transferU32(data.length)), new Uint8Array(transferU16(name.length)),
+        new Uint8Array(transferU16(0)), name, data
+      ]);
+      local.push(localHead);
+      var centralHead = transferConcat([
+        new Uint8Array([0x50, 0x4B, 0x01, 0x02]), new Uint8Array(transferU16(20)),
+        new Uint8Array(transferU16(20)), new Uint8Array(transferU16(0x0800)),
+        new Uint8Array(transferU16(0)), new Uint8Array(transferU16(dt.time)),
+        new Uint8Array(transferU16(dt.date)), new Uint8Array(transferU32(crc)),
+        new Uint8Array(transferU32(data.length)), new Uint8Array(transferU32(data.length)),
+        new Uint8Array(transferU16(name.length)), new Uint8Array(transferU16(0)),
+        new Uint8Array(transferU16(0)), new Uint8Array(transferU16(0)),
+        new Uint8Array(transferU16(0)), new Uint8Array(transferU32(0)),
+        new Uint8Array(transferU32(offset)), name
+      ]);
+      central.push(centralHead);
+      offset += localHead.length;
+    });
+    var centralData = transferConcat(central);
+    var end = transferConcat([
+      new Uint8Array([0x50, 0x4B, 0x05, 0x06]), new Uint8Array(transferU16(0)),
+      new Uint8Array(transferU16(0)), new Uint8Array(transferU16(files.length)),
+      new Uint8Array(transferU16(files.length)), new Uint8Array(transferU32(centralData.length)),
+      new Uint8Array(transferU32(offset)), new Uint8Array(transferU16(0))
+    ]);
+    return new Blob(local.concat(central, [end]), { type: 'application/zip' });
+  }
+  function transferZipForPosts(posts) {
+    var used = {}, files = [];
+    (posts || []).forEach(function (post) {
+      var base = transferSlug(post.title || post.id || 'post') || 'post';
+      var name = base + '.md', n = 2;
+      while (used[name]) { name = base + '-' + n + '.md'; n++; }
+      used[name] = true;
+      files.push({ name: name, text: transferPostMarkdown(post) });
+    });
+    files.push({ name: 'posts.json', text: transferBackupJson(posts) });
+    return transferZip(files);
+  }
+  async function transferExportOne(id, button, content) {
+    var old = button ? button.innerHTML : '';
+    if (button) { button.disabled = true; button.innerHTML = icon('spinner', 12) + ' ' + t('admin.transfer.exporting'); }
+    try {
+      // 页面加载时已经缓存全文；点击后可同步下载，避免部分浏览器拦截异步触发的下载。
+      var posts = (content && content.__iePosts) || await listFullPosts();
+      var post = posts.filter(function (p) { return p.id === id; })[0];
+      if (!post) { toast(t('admin.postList.notFound'), 'err'); return; }
+      var name = (transferSlug(post.title || post.id) || 'post') + '.md';
+      transferDownloadText(name, transferPostMarkdown(post), 'text/markdown;charset=utf-8');
+      toast(t('admin.transfer.exported', { count: 1 }), 'ok');
+    } catch (e) {
+      toast(t('admin.transfer.exportFail') + (e.message || e), 'err');
+    } finally {
+      if (button) { button.disabled = false; button.innerHTML = old; }
+    }
+  }
+  async function transferExportPosts(content, ids) {
+    var status = content.querySelector('#abIeStatus');
+    if (status) status.textContent = t('admin.transfer.exporting');
+    try {
+      var all = (content && content.__iePosts) || await listFullPosts();
+      var map = {};
+      all.forEach(function (p) { map[p.id] = p; });
+      var posts = ids && ids.length ? ids.map(function (id) { return map[id]; }).filter(Boolean) : all;
+      if (!posts.length) { toast(t('admin.transfer.noSelection'), 'err'); return; }
+      transferDownload('qingyu-posts-' + transferStamp() + '.zip', transferZipForPosts(posts));
+      toast(t('admin.transfer.exported', { count: posts.length }), 'ok');
+    } catch (e) {
+      toast(t('admin.transfer.exportFail') + (e.message || e), 'err');
+    } finally {
+      if (status) status.textContent = '';
+    }
+  }
+  async function transferExportBackup(content) {
+    var status = content.querySelector('#abIeStatus');
+    if (status) status.textContent = t('admin.transfer.exporting');
+    try {
+      var posts = (content && content.__iePosts) || await listFullPosts();
+      transferDownloadText('qingyu-backup-' + transferStamp() + '.json', transferBackupJson(posts), 'application/json;charset=utf-8');
+      toast(t('admin.transfer.exported', { count: posts.length }), 'ok');
+    } catch (e) {
+      toast(t('admin.transfer.exportFail') + (e.message || e), 'err');
+    } finally {
+      if (status) status.textContent = '';
+    }
+  }
+  function transferReadFile(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(String(reader.result || '')); };
+      reader.onerror = function () { reject(reader.error || new Error('read failed')); };
+      reader.readAsText(file);
+    });
+  }
+  function transferSyncStaticImported(post) {
+    if (!Array.isArray(window.BLOG_POSTS)) return;
+    var idx = -1;
+    for (var i = 0; i < window.BLOG_POSTS.length; i++) {
+      if (window.BLOG_POSTS[i] && window.BLOG_POSTS[i].id === post.id) { idx = i; break; }
+    }
+    if (idx >= 0) window.BLOG_POSTS[idx] = Object.assign({}, window.BLOG_POSTS[idx], post);
+    else window.BLOG_POSTS.push(post);
+  }
+  async function transferImportFiles(fileList, content) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) return;
+    var status = content.querySelector('#abIeStatus');
+    if (status) status.textContent = t('admin.transfer.reading');
+    var parsed = [];
+    var failed = 0;
+    for (var i = 0; i < files.length; i++) {
+      var name = String(files[i].name || '');
+      if (!/\.(md|markdown|json)$/i.test(name)) continue;
+      try {
+        var text = await transferReadFile(files[i]);
+        var list = /\.json$/i.test(name) ? transferParseJson(text) : [transferParseMarkdown(text, name)];
+        list.forEach(function (p) { if (p) parsed.push(p); });
+      } catch (e) { failed++; }
+    }
+    if (!parsed.length) {
+      if (status) status.textContent = '';
+      toast(t('admin.transfer.invalidFiles'), 'err');
+      return;
+    }
+    var used = {};
+    parsed.forEach(function (post) {
+      var base = post.id, n = 2;
+      while (used[post.id]) { post.id = base + '-' + n; n++; }
+      used[post.id] = true;
+    });
+    var existing = {};
+    try {
+      var current = await listPosts();
+      current.forEach(function (p) { existing[p.id] = p; });
+    } catch (e) {}
+    var conflicts = parsed.filter(function (p) { return !!existing[p.id]; });
+    function runImport() {
+      var ok = 0;
+      (async function () {
+        for (var i = 0; i < parsed.length; i++) {
+          var post = parsed[i];
+          if (status) status.textContent = t('admin.transfer.importing', { done: i + 1, total: parsed.length });
+          try {
+            await savePost(post, !existing[post.id]);
+            if (!cloudOn()) transferSyncStaticImported(post);
+            ok++;
+          } catch (e) { failed++; }
+        }
+        if (status) status.textContent = '';
+        if (ok) {
+          toast(cloudOn() ? t('admin.transfer.imported', { count: ok }) : t('admin.transfer.importedLocal', { count: ok }), 'ok');
+          pageImportExport(content);
+        } else {
+          toast(t('admin.transfer.importFail'), 'err');
+        }
+      })();
+    }
+    if (conflicts.length) {
+      confirmModal(t('admin.transfer.overwriteTitle'),
+        '<p class="ab-muted">' + esc(t('admin.transfer.overwriteBody', { count: conflicts.length })) + '</p>',
+        runImport, t('admin.transfer.continue'));
+    } else {
+      runImport();
+    }
+  }
+  function pageImportExport(content) {
+    content.innerHTML =
+      '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.transfer.title') + '</h1><p class="ab-page-sub">' + t('admin.transfer.desc') + '</p></div>' +
+        '<div class="ab-row" style="align-items:center;gap:8px;flex-wrap:wrap">' +
+          '<button class="ab-btn" id="abIeImportFiles">' + icon('upload', 15) + ' ' + t('admin.transfer.importFiles') + '</button>' +
+          '<button class="ab-btn primary" id="abIeImportFolder">' + icon('file', 15) + ' ' + t('admin.transfer.importFolder') + '</button>' +
+        '</div></div>' +
+      '<input type="file" id="abIeFileInput" accept=".md,.markdown,.json" multiple hidden>' +
+      '<input type="file" id="abIeFolderInput" accept=".md,.markdown,.json" multiple webkitdirectory directory hidden>' +
+      '<div class="ab-grid cols-2">' +
+        '<div class="ab-card"><div class="ab-section-title">' + icon('download', 16) + ' ' + t('admin.transfer.exportTitle') + '</div>' +
+          '<p class="ab-muted" style="line-height:1.7;margin:10px 0 14px">' + t('admin.transfer.exportHint') + '</p>' +
+          '<div class="ab-row" style="gap:8px;flex-wrap:wrap"><button class="ab-btn" id="abIeExportAll" disabled>' + icon('download', 14) + ' ' + t('admin.transfer.exportAll') + '</button>' +
+          '<button class="ab-btn" id="abIeExportBackup" disabled>' + icon('save', 14) + ' ' + t('admin.transfer.exportBackup') + '</button></div></div>' +
+        '<div class="ab-card"><div class="ab-section-title">' + icon('upload', 16) + ' ' + t('admin.transfer.importTitle') + '</div>' +
+          '<p class="ab-muted" style="line-height:1.7;margin:10px 0 14px">' + t('admin.transfer.importHint') + '</p>' +
+          '<p class="ab-hint" id="abIeStatus" style="min-height:18px;margin:0"></p></div>' +
+      '</div>' +
+      '<div class="ab-card" style="margin-top:18px">' +
+        '<div class="ab-toolbar" style="margin-bottom:12px;align-items:center">' +
+          '<label class="ab-row" style="align-items:center;gap:7px;cursor:pointer"><input type="checkbox" id="abIeSelectAll"> <span>' + t('admin.transfer.selectAll') + '</span></label>' +
+          '<span class="ab-muted" id="abIeSelected" style="font-size:13px">' + t('admin.transfer.selected', { count: 0 }) + '</span>' +
+          '<button class="ab-btn sm" id="abIeExportSelected" style="margin-left:auto" disabled>' + icon('download', 13) + ' ' + t('admin.transfer.exportSelected') + '</button>' +
+        '</div>' +
+        '<div class="ab-table-wrap"><table class="ab-table"><thead><tr><th style="width:40px"></th><th>' + t('admin.transfer.colPost') + '</th><th>' + t('admin.transfer.colDate') + '</th><th>' + t('admin.transfer.colStatus') + '</th><th class="col-actions">' + t('admin.transfer.colActions') + '</th></tr></thead><tbody id="abIeTableBody"></tbody></table></div>' +
+      '</div>';
+    bindImportExport(content);
+    loadImportExport(content);
+  }
+  function bindImportExport(content) {
+    var fileInput = content.querySelector('#abIeFileInput');
+    var folderInput = content.querySelector('#abIeFolderInput');
+    content.querySelector('#abIeImportFiles').addEventListener('click', function () { fileInput.value = ''; fileInput.click(); });
+    content.querySelector('#abIeImportFolder').addEventListener('click', function () { folderInput.value = ''; folderInput.click(); });
+    fileInput.addEventListener('change', function () { transferImportFiles(fileInput.files, content); });
+    folderInput.addEventListener('change', function () { transferImportFiles(folderInput.files, content); });
+    content.querySelector('#abIeExportAll').addEventListener('click', function () { transferExportPosts(content, null); });
+    content.querySelector('#abIeExportBackup').addEventListener('click', function () { transferExportBackup(content); });
+    var all = content.querySelector('#abIeSelectAll');
+    all.addEventListener('change', function () {
+      content.querySelectorAll('.ab-ie-check').forEach(function (cb) { cb.checked = all.checked; });
+      updateImportExportSelection(content);
+    });
+  }
+  function updateImportExportSelection(content) {
+    var checks = Array.prototype.slice.call(content.querySelectorAll('.ab-ie-check'));
+    var selected = checks.filter(function (cb) { return cb.checked; });
+    var all = content.querySelector('#abIeSelectAll');
+    if (all) {
+      all.checked = checks.length > 0 && selected.length === checks.length;
+      all.indeterminate = selected.length > 0 && selected.length < checks.length;
+    }
+    var label = content.querySelector('#abIeSelected');
+    if (label) label.textContent = t('admin.transfer.selected', { count: selected.length });
+  }
+  async function loadImportExport(content) {
+    var body = content.querySelector('#abIeTableBody');
+    body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.transfer.loading') + '</td></tr>';
+    var posts = [];
+    try { posts = await listFullPosts(); content.__iePosts = posts; }
+    catch (e) {
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>';
+      return;
+    }
+    posts.sort(function (a, b) { return (b.date || '').localeCompare(a.date || ''); });
+    if (!posts.length) {
+      body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.transfer.empty') + '</td></tr>';
+      return;
+    }
+    body.innerHTML = posts.map(function (p) {
+      var postStatus = p.status || 'published';
+      var badge = postStatus === 'scheduled'
+        ? '<span class="ab-status scheduled">' + icon('clock', 11) + ' ' + t('admin.dashboard.scheduled') + (p.publishAt ? ' · ' + esc(fmtTimestamp(p.publishAt)) : '') + '</span>'
+        : '<span class="ab-status ' + (postStatus === 'draft' ? 'draft' : 'published') + '">' + (postStatus === 'draft' ? t('admin.dashboard.drafts') : t('admin.dashboard.published')) + '</span>';
+      return '<tr>' +
+        '<td><input class="ab-ie-check" type="checkbox" data-id="' + esc(enc(p.id)) + '"></td>' +
+        '<td><b>' + esc(p.title || t('admin.postList.noTitle')) + '</b>' + (p.pinned ? ' <span class="ab-chip">' + t('admin.postList.pin') + '</span>' : '') + '</td>' +
+        '<td class="ab-td-date">' + esc(fmtPostDate(p.date)) + '</td>' +
+        '<td class="ab-td-status">' + badge + '</td>' +
+        '<td class="col-actions"><button class="ab-btn sm" data-ie-export="' + esc(enc(p.id)) + '">' + icon('download', 12) + ' ' + t('admin.transfer.exportMd') + '</button></td>' +
+      '</tr>';
+    }).join('');
+    body.querySelectorAll('.ab-ie-check').forEach(function (cb) { cb.addEventListener('change', function () { updateImportExportSelection(content); }); });
+    body.querySelectorAll('[data-ie-export]').forEach(function (btn) {
+      btn.addEventListener('click', function () { transferExportOne(dec(btn.getAttribute('data-ie-export')), btn, content); });
+    });
+    content.querySelector('#abIeExportSelected').onclick = function () {
+      var ids = Array.prototype.slice.call(content.querySelectorAll('.ab-ie-check')).filter(function (cb) { return cb.checked; }).map(function (cb) { return dec(cb.getAttribute('data-id')); });
+      transferExportPosts(content, ids);
+    };
+    ['#abIeExportAll', '#abIeExportBackup', '#abIeExportSelected'].forEach(function (sel) {
+      var btn = content.querySelector(sel);
+      if (btn) btn.disabled = false;
+    });
+    updateImportExportSelection(content);
+  }
 
   /* ====================== AI（写作助手 & 评论汇总） ======================
    * 复用 window.aiProbe 探测（app.js）；AI 不可用 → slot 留空，后台其余功能不受影响。
@@ -1193,6 +2191,117 @@
     });
   }
 
+  function ogSourceFingerprint(title, date, tags, series) {
+    return JSON.stringify([String(title || ''), String(date || ''), (tags || []).join('\u0001'), String(series || '')]);
+  }
+  function wrapCanvasText(ctx, text, maxWidth, maxLines) {
+    var out = [], line = '';
+    Array.from(String(text || '')).forEach(function (ch) {
+      var next = line + ch;
+      if (ctx.measureText(next).width > maxWidth && line) {
+        out.push(line); line = ch;
+      } else line = next;
+    });
+    if (line) out.push(line);
+    if (out.length > maxLines) {
+      out = out.slice(0, maxLines);
+      while (out.length && ctx.measureText(out[out.length - 1] + '…').width > maxWidth) out[out.length - 1] = out[out.length - 1].slice(0, -1);
+      out[out.length - 1] += '…';
+    }
+    return out;
+  }
+  function canvasBlob(canvas) {
+    return new Promise(function (resolve, reject) {
+      canvas.toBlob(function (blob) { blob ? resolve(blob) : reject(new Error('图片生成失败')); }, 'image/png', 0.94);
+    });
+  }
+  function canvasBlobType(canvas, type, quality) {
+    return new Promise(function (resolve) { canvas.toBlob(function (blob) { resolve(blob); }, type, quality); });
+  }
+  function loadImageFile(file) {
+    return new Promise(function (resolve, reject) {
+      var url = URL.createObjectURL(file);
+      var img = new Image();
+      img.onload = function () { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('图片解码失败')); };
+      img.src = url;
+    });
+  }
+  async function resizeImageFile(file, maxDim, quality, forceType) {
+    var img = await loadImageFile(file);
+    var scale = Math.min(1, maxDim / Math.max(img.naturalWidth || img.width, img.naturalHeight || img.height));
+    var w = Math.max(1, Math.round((img.naturalWidth || img.width) * scale));
+    var h = Math.max(1, Math.round((img.naturalHeight || img.height) * scale));
+    var canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    var ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, w, h);
+    var type = forceType || 'image/webp';
+    var blob = await canvasBlobType(canvas, type, quality || 0.82);
+    if (!blob && type !== 'image/jpeg') blob = await canvasBlobType(canvas, 'image/jpeg', quality || 0.82);
+    return blob ? { blob: blob, width: w, height: h } : null;
+  }
+  async function compressImageFile(file) {
+    var type = String(file.type || '').toLowerCase();
+    if (!/^image\//.test(type) || /gif|svg|ico/.test(type)) return { file: file, thumb: null, compressed: false };
+    try {
+      var main = await resizeImageFile(file, 2200, 0.82, 'image/webp');
+      if (!main || !main.blob) return { file: file, thumb: null, compressed: false };
+      // 对本来就很小的图片避免“越压越大”
+      if (main.blob.size >= file.size && /jpeg|jpg|png|webp/.test(type)) return { file: file, thumb: null, compressed: false };
+      var ext = main.blob.type === 'image/jpeg' ? '.jpg' : '.webp';
+      var base = String(file.name || 'image').replace(/\.[^.]+$/, '') || 'image';
+      var mainFile = new File([main.blob], base + ext, { type: main.blob.type, lastModified: Date.now() });
+      var thumb = await resizeImageFile(file, 640, 0.76, 'image/webp');
+      var thumbFile = thumb && thumb.blob ? new File([thumb.blob], base + '-thumb.webp', { type: thumb.blob.type, lastModified: Date.now() }) : null;
+      return { file: mainFile, thumb: thumbFile, compressed: true, originalSize: file.size, width: main.width, height: main.height };
+    } catch (e) {
+      return { file: file, thumb: null, compressed: false };
+    }
+  }
+
+  async function generateShareImage(content, postId, title, date, tags, series) {
+    if (!cloudOn()) throw new Error(t('admin.editor.ogCloudOnly'));
+    var canvas = document.createElement('canvas');
+    canvas.width = 1200; canvas.height = 630;
+    var ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas 不可用');
+    var accent = getComputedStyle(document.documentElement).getPropertyValue('--ab-primary').trim() || '#c25e3a';
+    var grad = ctx.createLinearGradient(0, 0, 1200, 630);
+    grad.addColorStop(0, '#f8f2e9');
+    grad.addColorStop(0.55, '#ffffff');
+    grad.addColorStop(1, '#efe3d4');
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, 1200, 630);
+    ctx.globalAlpha = 0.12; ctx.fillStyle = accent;
+    ctx.beginPath(); ctx.arc(1050, 80, 260, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(80, 590, 230, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = accent; ctx.fillRect(92, 86, 8, 108);
+    ctx.fillStyle = '#332b25'; ctx.font = '700 72px "Microsoft YaHei","PingFang SC",sans-serif';
+    var lines = wrapCanvasText(ctx, title || t('admin.postList.noTitle'), 960, 3);
+    lines.forEach(function (line, i) { ctx.fillText(line, 130, 150 + i * 86); });
+    ctx.font = '28px "Microsoft YaHei","PingFang SC",sans-serif'; ctx.fillStyle = '#766b61';
+    var meta = [date, series, (tags || []).slice(0, 3).join(' · ')].filter(Boolean).join('  ·  ');
+    ctx.fillText(meta, 132, 500);
+    ctx.font = '600 28px "Microsoft YaHei","PingFang SC",sans-serif'; ctx.fillStyle = accent;
+    ctx.fillText(getSiteName ? getSiteName() : 'Qingyu\'Blog', 132, 555);
+    ctx.fillStyle = '#c9b9a8'; ctx.fillRect(132, 580, 936, 2);
+    ctx.font = '20px "Microsoft YaHei","PingFang SC",sans-serif'; ctx.fillStyle = '#9a8d80';
+    ctx.fillText('1200 × 630  ·  Open Graph', 760, 602);
+    var blob = await canvasBlob(canvas);
+    var signed = await api('api/admin/og-upload-url', { method: 'POST', body: JSON.stringify({ postId: postId }) });
+    if (!signed || !signed.uploadUrl || !signed.publicUrl) throw new Error('分享图上传地址获取失败');
+    var up = await fetch(signed.uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'image/png' }, body: blob });
+    if (!up.ok) throw new Error('分享图上传失败 HTTP ' + up.status);
+    return signed.publicUrl;
+  }
+  function updateOgPreview(content, url) {
+    var preview = content.querySelector('#abOgPreview');
+    if (!preview) return;
+    preview.innerHTML = url ? '<img src="' + esc(url) + '" alt="" style="max-width:360px;max-height:190px;border-radius:8px;border:1px solid var(--ab-border)">' : '<span class="ab-muted">' + t('admin.editor.ogEmpty') + '</span>';
+  }
+
   /* ====================== 编辑器 ====================== */
   function pageEditor(content, route) {
     content.innerHTML =
@@ -1201,8 +2310,12 @@
         '<div class="ab-editor-meta">' +
           '<div class="ab-field ab-title-field" style="margin:0"><label class="ab-label" for="abTitle">' + t('admin.editor.titleLabel') + '</label><input class="ab-input" id="abTitle" placeholder="' + t('admin.editor.titlePlaceholder') + '" autocomplete="off"><label class="ab-hint">' + t('admin.editor.titleHint') + '</label></div>' +
           '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.tagsPlaceholder') + '</label><input class="ab-input" id="abTags" placeholder="' + t('admin.editor.tagsExample') + '" autocomplete="off"></div>' +
+          '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.seriesLabel') + '</label><div class="ab-row"><input class="ab-input" id="abSeries" placeholder="' + t('admin.editor.seriesPlaceholder') + '" autocomplete="off"><input class="ab-input" id="abSeriesOrder" type="number" min="0" step="1" style="max-width:110px" placeholder="' + t('admin.editor.seriesOrder') + '"></div><label class="ab-hint">' + t('admin.editor.seriesHint') + '</label></div>' +
+          '<div class="ab-field" style="margin:0"><label class="ab-label" for="abDate">' + t('admin.editor.dateLabel') + '</label><div class="ab-row"><input class="ab-input" id="abDate" type="datetime-local" step="60"><button class="ab-btn sm" id="abNow">' + t('admin.editor.setNow') + '</button></div><label class="ab-hint">' + t('admin.editor.dateHint') + '</label></div>' +
+          (cloudOn() ? '<div class="ab-field" style="margin:0"><label class="ab-label" for="abSchedule">' + t('admin.editor.scheduleLabel') + '</label><input class="ab-input" id="abSchedule" type="datetime-local" step="60"><label class="ab-hint">' + t('admin.editor.scheduleHint') + '</label></div>' : '') +
         '</div>' +
         '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.coverPlaceholder') + '</label><div class="ab-row"><input class="ab-input" id="abCover" placeholder="https://…"><button class="ab-btn sm" id="abPickCover">' + t('admin.editor.selectMedia') + '</button></div></div>' +
+        '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.ogLabel') + '</label><input type="hidden" id="abOgImage"><div class="ab-row" style="align-items:center;gap:10px;flex-wrap:wrap"><button class="ab-btn sm" id="abOgGenerate">' + icon('image', 13) + ' ' + t('admin.editor.ogGenerate') + '</button><label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="abOgAuto" checked> ' + t('admin.editor.ogAuto') + '</label></div><div id="abOgPreview" style="margin-top:8px"></div><label class="ab-hint">' + t('admin.editor.ogHint') + '</label></div>' +
         '<div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:0">' +
           '<label style="display:flex;align-items:center;gap:6px;font-size:14px;cursor:pointer"><input type="checkbox" id="abPinned"> ' + icon('pin', 14) + ' ' + t('admin.editor.pin') + '</label>' +
         '</div>' +
@@ -1219,32 +2332,95 @@
             '<button class="ab-tool" data-md="ul" title="' + t('admin.editor.list') + '">≡</button>' +
             '<button class="ab-tool" data-md="link" title="' + t('admin.editor.link') + '">' + icon('link', 15) + '</button>' +
             '<button class="ab-tool" data-md="img" title="' + t('admin.editor.image') + '">' + icon('image', 15) + '</button>' +
+            '<button class="ab-tool" data-md="wiki" title="' + t('admin.editor.wiki') + '">[[ ]]</button>' +
+            '<button class="ab-tool" data-md="table" title="' + t('admin.editor.table') + '">▦</button>' +
+            '<button class="ab-tool" data-md="task" title="' + t('admin.editor.task') + '">☑</button>' +
+            '<button class="ab-tool" data-md="hr" title="' + t('admin.editor.hr') + '">―</button>' +
+            '<button class="ab-tool" data-md="codeblock" title="' + t('admin.editor.codeBlock') + '">{ }</button>' +
+            '<select class="ab-tool-select" id="abMdLang" title="' + t('admin.editor.codeBlock') + '" aria-label="' + t('admin.editor.codeBlock') + '"><option value="">' + t('admin.editor.langPlain') + '</option><option value="js">JavaScript</option><option value="ts">TypeScript</option><option value="python">Python</option><option value="bash">Bash</option><option value="json">JSON</option><option value="html">HTML</option><option value="css">CSS</option><option value="sql">SQL</option><option value="go">Go</option><option value="java">Java</option></select>' +
             '<button class="ab-tool" id="abSmoji" title="' + t('admin.editor.emoji') + '" aria-label="' + t('admin.editor.emoji') + '">😊</button>' +
           '</div>' +
           '<textarea class="ab-editor-area" id="abBody" placeholder="' + t('admin.editor.writeHint') + '"></textarea>' +
+          '<div class="ab-editor-stats" id="abEditorStats"></div>' +
         '</div>' +
         '<div class="ab-editor-pane"><div class="ab-editor-preview" id="abPreviewPane"></div></div>' +
       '</div>' +
       '<div class="ab-row ab-editor-actions">' +
         (cloudOn() ? '' : '<button class="ab-btn" id="abExport">' + t('editor.exportAll') + '</button>') +
+        (route.id ? '<button class="ab-btn" id="abHistory">' + icon('refresh', 15) + ' ' + t('admin.revisions.button') + '</button>' : '') +
+        (cloudOn() ? '<button class="ab-btn" id="abScheduleBtn">' + icon('clock', 15) + ' ' + t('admin.editor.scheduleButton') + '</button>' : '') +
         '<button class="ab-btn" id="abSaveDraft">' + t('admin.editor.saveDraft') + '</button>' +
         '<button class="ab-btn primary" id="abPublish">' + icon('check', 15) + ' ' + t('admin.editor.publish') + '</button>' +
       '</div>';
 
     bindEditor(content, route);
-    if (route.id) loadEditor(content, route.id); else updatePreview(content);
+    if (route.id) loadEditor(content, route.id);
+    else {
+      var dateInput = content.querySelector('#abDate');
+      if (dateInput) dateInput.value = localDateTimeValue(new Date());
+      updatePreview(content);
+    }
     initAbAi(content);
   }
 
   function bindEditor(content, route) {
     var area = content.querySelector('#abBody');
-    area.addEventListener('input', function () { autosizeArea(area); });
+    area.addEventListener('input', function () { autosizeArea(area); updateEditorStats(content); });
     area.addEventListener('input', debounce(function () { updatePreview(content); }, 200));
-    content.querySelector('#abToolbar').querySelectorAll('[data-md]').forEach(function (b) {
-      b.addEventListener('click', function () { insertMd(area, b.getAttribute('data-md')); updatePreview(content); area.focus(); });
+    area.addEventListener('paste', function (e) {
+      var items = e.clipboardData && e.clipboardData.items ? Array.prototype.slice.call(e.clipboardData.items) : [];
+      var imgItem = items.filter(function (it) { return it.type && it.type.indexOf('image/') === 0; })[0];
+      if (!imgItem) return;
+      var file = imgItem.getAsFile();
+      if (!file) return;
+      e.preventDefault();
+      insertPastedImage(content, area, file);
     });
+    // 常用快捷键：Ctrl/⌘ + B / I / K / S
+    area.addEventListener('keydown', function (e) {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      var k = String(e.key || '').toLowerCase();
+      if (k === 'b' || k === 'i' || k === 'k') {
+        e.preventDefault();
+        var langSel = content.querySelector('#abMdLang');
+        insertMd(area, k === 'b' ? 'bold' : (k === 'i' ? 'italic' : 'link'), { lang: langSel ? langSel.value : '' });
+        updatePreview(content); updateEditorStats(content);
+      } else if (k === 's') {
+        e.preventDefault();
+        saveEditor(content, route, 'draft');
+      }
+    });
+    content.querySelector('#abToolbar').querySelectorAll('[data-md]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var langSel = content.querySelector('#abMdLang');
+        insertMd(area, b.getAttribute('data-md'), { lang: langSel ? langSel.value : '' });
+        updatePreview(content); updateEditorStats(content); area.focus();
+      });
+    });
+    var dateInput = content.querySelector('#abDate');
+    var nowBtn = content.querySelector('#abNow');
+    if (nowBtn && dateInput) nowBtn.addEventListener('click', function () { dateInput.value = localDateTimeValue(new Date()); });
     content.querySelector('#abSaveDraft').addEventListener('click', function () { saveEditor(content, route, 'draft'); });
     content.querySelector('#abPublish').addEventListener('click', function () { saveEditor(content, route, 'published'); });
+    var scheduleBtn = content.querySelector('#abScheduleBtn');
+    if (scheduleBtn) scheduleBtn.addEventListener('click', function () { saveEditor(content, route, 'scheduled'); });
+    var historyBtn = content.querySelector('#abHistory');
+    if (historyBtn) historyBtn.addEventListener('click', function () { openRevisionHistory(content, route); });
+    var ogBtn = content.querySelector('#abOgGenerate');
+    if (ogBtn) ogBtn.addEventListener('click', function () {
+      var title = content.querySelector('#abTitle').value.trim();
+      if (!title) { toast(t('admin.editor.noTitle'), 'err'); return; }
+      var tags = content.querySelector('#abTags').value.split(/[,，]/).map(function (x) { return x.trim(); }).filter(Boolean);
+      var date = normalizeEditorDate(content.querySelector('#abDate').value).slice(0, 10);
+      var postId = route.id || slug(title);
+      ogBtn.disabled = true; ogBtn.innerHTML = icon('spinner', 12) + ' ' + t('admin.editor.ogGenerating');
+      generateShareImage(content, postId, title, date, tags, content.querySelector('#abSeries').value.trim()).then(function (url) {
+        content.querySelector('#abOgImage').value = url;
+        content.__ogSource = ogSourceFingerprint(title, date, tags, content.querySelector('#abSeries').value.trim());
+        updateOgPreview(content, url); toast(t('admin.editor.ogGenerated'), 'ok');
+      }).catch(function (e) { toast(t('admin.editor.ogFail') + (e.message || e), 'err'); })
+        .finally(function () { ogBtn.disabled = false; ogBtn.innerHTML = icon('image', 13) + ' ' + t('admin.editor.ogGenerate'); });
+    });
     var exp = content.querySelector('#abExport');
     if (exp) exp.addEventListener('click', downloadAllStatic);
     var pick = content.querySelector('#abPickCover');
@@ -1252,6 +2428,23 @@
     var smojiBtn = content.querySelector('#abSmoji');
     if (smojiBtn && window.initSmojiPicker) window.initSmojiPicker(smojiBtn, area);
   }
+  async function insertPastedImage(content, area, file) {
+    toast(t('admin.media.pasteUploading'), 'ok');
+    try {
+      var result = await uploadImageAsset(file);
+      var url = result.media && (result.media.url || result.media.publicUrl) || '';
+      var alt = t('admin.media.pastedAlt');
+      var md = '![' + alt + '](' + url + ')';
+      var start = area.selectionStart || 0, end = area.selectionEnd || 0;
+      area.value = area.value.slice(0, start) + md + area.value.slice(end);
+      area.selectionStart = area.selectionEnd = start + md.length;
+      area.dispatchEvent(new Event('input'));
+      toast(t('admin.media.pasteUploaded'), 'ok');
+    } catch (e) {
+      toast(t('admin.media.pasteUploadFail') + (e.message || e), 'err');
+    }
+  }
+
   function updatePreview(content) {
     var area = content.querySelector('#abBody');
     var pane = content.querySelector('#abPreviewPane');
@@ -1266,7 +2459,25 @@
     area.style.height = 'auto';
     area.style.height = Math.max(area.scrollHeight, 420) + 'px';
   }
-  function insertMd(area, type) {
+  /** 正文字数与预计阅读时长（中日韩按字计，拉丁按词计） */
+  function editorCounts(text) {
+    var str = String(text || '');
+    var cjkRe = /[\u4e00-\u9fa5\u3040-\u30ff\uac00-\ud7af]/g;
+    var cjk = (str.match(cjkRe) || []).length;
+    var words = (str.replace(cjkRe, ' ').match(/[A-Za-z0-9_'-]+/g) || []).length;
+    var total = cjk + words;
+    return { chars: str.length, total: total, minutes: Math.max(1, Math.ceil(total / 400)) };
+  }
+  function updateEditorStats(content) {
+    var box = content.querySelector('#abEditorStats');
+    if (!box) return;
+    var area = content.querySelector('#abBody');
+    var c = editorCounts(area ? area.value : '');
+    box.innerHTML = '<span>' + t('admin.editor.stats', { chars: c.chars, words: c.total, minutes: c.minutes }) + '</span>' +
+      '<span class="ab-hint">' + t('admin.editor.shortcutHint') + '</span>';
+  }
+  function insertMd(area, type, opts) {
+    opts = opts || {};
     var s = area.selectionStart, e = area.selectionEnd, v = area.value;
     var sel = v.slice(s, e), pre = '', post = '', rep = sel;
     if (type === 'bold') { pre = '**'; post = '**'; }
@@ -1275,20 +2486,42 @@
     else if (type === 'quote') { pre = '> '; }
     else if (type === 'code') { pre = '`'; post = '`'; }
     else if (type === 'ul') { pre = '- '; }
+    else if (type === 'task') { pre = '- [ ] '; }
+    else if (type === 'hr') { rep = (s > 0 && v.charAt(s - 1) !== '\n' ? '\n' : '') + '---\n'; }
+    else if (type === 'table') {
+      var col = t('admin.editor.tableCol'), cell = t('admin.editor.tableCell');
+      rep = '| ' + col + '1 | ' + col + '2 | ' + col + '3 |\n| --- | --- | --- |\n| ' + cell + ' | ' + cell + ' | ' + cell + ' |\n';
+    }
+    else if (type === 'codeblock') {
+      var lang = String(opts.lang || '').trim();
+      rep = '```' + lang + '\n' + (sel || '') + '\n```';
+    }
     else if (type === 'link') { rep = '[' + (sel || t('editor.linkBtn')) + '](https://)'; }
     else if (type === 'img') { rep = '![' + (sel || t('editor.imgBtn')) + '](https://)'; }
+    else if (type === 'wiki') { rep = '[[' + (sel || t('admin.editor.wiki')) + ']]'; }
     area.value = v.slice(0, s) + pre + rep + post + v.slice(e);
     area.selectionStart = area.selectionEnd = s + pre.length + rep.length;
   }
   async function loadEditor(content, id) {
     var p = await getPost(id);
     if (!p) { toast(t('admin.editor.notFound'), 'err'); return; }
+    content.__editingPost = p;
     content.querySelector('#abTitle').value = p.title || '';
     content.querySelector('#abTags').value = (p.tags || []).join(', ');
+    content.querySelector('#abSeries').value = p.series || '';
+    content.querySelector('#abSeriesOrder').value = p.seriesOrder ? String(p.seriesOrder) : '';
     content.querySelector('#abCover').value = p.cover || '';
+    content.querySelector('#abOgImage').value = p.ogImage || '';
+    content.__ogSource = ogSourceFingerprint(p.title, p.date, (p.tags || []), p.series || '');
+    updateOgPreview(content, p.ogImage || '');
+    var dateInput = content.querySelector('#abDate');
+    if (dateInput) dateInput.value = toDateTimeLocal(p.date || '');
+    var scheduleInput = content.querySelector('#abSchedule');
+    if (scheduleInput && p.publishAt) scheduleInput.value = toDateTimeLocal(p.publishAt);
     content.querySelector('#abBody').value = p.content || '';
     content.querySelector('#abPinned').checked = !!p.pinned;
     updatePreview(content);
+    updateEditorStats(content);
   }
   async function saveEditor(content, route, status) {
     var title = content.querySelector('#abTitle').value.trim();
@@ -1298,22 +2531,46 @@
     var tags = content.querySelector('#abTags').value.split(/[,，]/).map(function (t) { return t.trim(); }).filter(Boolean);
 
     var wantPinned = !!content.querySelector('#abPinned').checked;
+    var dateInput = content.querySelector('#abDate');
+    var dateValue = normalizeEditorDate(dateInput ? dateInput.value : '');
+    var publishAt = null;
+    if (status === 'scheduled') {
+      var scheduleInput = content.querySelector('#abSchedule');
+      publishAt = dateTimeLocalToMs(scheduleInput ? scheduleInput.value : '');
+      if (!publishAt || publishAt <= Date.now()) { toast(t('admin.editor.scheduleRequired'), 'err'); return; }
+    }
 
-    var post = {
-      id: id, title: title, date: new Date().toISOString().slice(0, 10),
+    var seriesValue = content.querySelector('#abSeries').value.trim();
+    var ogImage = content.querySelector('#abOgImage').value || '';
+    var ogFingerprint = ogSourceFingerprint(title, dateValue, tags, seriesValue);
+    var onlineNow = !(typeof navigator !== 'undefined' && navigator.onLine === false);
+    if (cloudOn() && onlineNow && content.querySelector('#abOgAuto').checked && (!ogImage || content.__ogSource !== ogFingerprint)) {
+      try {
+        ogImage = await generateShareImage(content, id, title, dateValue.slice(0, 10), tags, seriesValue);
+        content.querySelector('#abOgImage').value = ogImage;
+        content.__ogSource = ogFingerprint;
+        updateOgPreview(content, ogImage);
+      } catch (e) { /* 分享图失败不阻塞文章保存 */ }
+    }
+
+    var post = Object.assign({}, content.__editingPost || {}, {
+      id: id, title: title, date: dateValue, publishAt: publishAt,
+      series: seriesValue,
+      ogImage: ogImage,
+      seriesOrder: Math.max(0, Math.floor(Number(content.querySelector('#abSeriesOrder').value) || 0)),
       excerpt: (body.replace(/[#>*`\-!\[\]()]/g, '').slice(0, 120).trim()),
       content: body, cover: content.querySelector('#abCover').value.trim(),
       pinned: wantPinned, tags: tags,
       status: status
-    };
+    });
 
-    var btn = status === 'published' ? content.querySelector('#abPublish') : content.querySelector('#abSaveDraft');
+    var btn = status === 'published' ? content.querySelector('#abPublish') : (status === 'scheduled' ? content.querySelector('#abScheduleBtn') : content.querySelector('#abSaveDraft'));
     btn.disabled = true;
+    var isNew = !route.id;
     try {
-      var isNew = !route.id;
       var r = await savePost(post, isNew);
       if (r && (r.ok || r.post)) {
-        toast(status === 'published' ? t('admin.editor.saved') : t('admin.editor.savedDraft'), 'ok');
+        toast(status === 'published' ? t('admin.editor.saved') : (status === 'scheduled' ? t('admin.editor.scheduled') : t('admin.editor.savedDraft')), 'ok');
         if (cloudOn()) go('/admin/posts'); else {
           toast(t('admin.editor.savedLocal'), 'ok');
         }
@@ -1322,6 +2579,7 @@
       }
     } catch (e) {
       if (!cloudOn()) { saveStaticPost(post); toast(t('admin.editor.savedDraft'), 'ok'); }
+      else if (isNetworkFailure(e)) { queueOfflinePost(post, isNew); toast(t('admin.editor.savedOffline'), 'ok'); }
       else toast(t('admin.editor.saveFail') + (e.message || e), 'err');
     } finally { btn.disabled = false; }
   }
@@ -1336,12 +2594,72 @@
     api('api/media').then(function (d) {
       var list = (d && d.media) || [];
       mask.querySelector('#abPickerGrid').innerHTML = list.length ? ('<div class="ab-media-grid">' + list.map(function (m) {
-        return '<div class="ab-media-card" data-url="' + esc(m.url) + '" style="cursor:pointer"><div class="ab-media-thumb"><img src="' + esc(m.url) + '" alt=""></div><div class="ab-media-meta"><div class="ab-media-name">' + esc(m.name || t('admin.media.colImage')) + '</div></div></div>';
+        return '<div class="ab-media-card" data-url="' + esc(m.url) + '" style="cursor:pointer"><div class="ab-media-thumb"><img src="' + esc(m.thumbUrl || m.thumb_url || m.url) + '" alt=""></div><div class="ab-media-meta"><div class="ab-media-name">' + esc(m.name || t('admin.media.colImage')) + '</div></div></div>';
       }).join('') + '</div>') : '<div class="ab-empty"><p>' + t('admin.media.empty') + '</p></div>';
       mask.querySelectorAll('[data-url]').forEach(function (c) { c.addEventListener('click', function () {
         content.querySelector('#abCover').value = c.getAttribute('data-url'); mask.remove(); toast(t('admin.editor.selectMedia'), 'ok');
       }); });
     }).catch(function (e) { mask.querySelector('#abPickerGrid').innerHTML = '<div class="ab-empty"><p>' + t('admin.media.readFail') + '</p></div>'; });
+  }
+
+  /* ====================== 文章系列 / 专栏 ====================== */
+  function pageSeries(content) {
+    content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.series.title') + '</h1><p class="ab-page-sub">' + t('admin.series.desc') + '</p></div>' +
+      '<button class="ab-btn primary" data-link="/admin/posts/new">' + icon('pen', 15) + ' ' + t('admin.series.write') + '</button></div>' +
+      '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.series.colName') + '</th><th>' + t('admin.series.colCount') + '</th><th>' + t('admin.series.colOrder') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th></tr></thead><tbody id="abSeriesBody"></tbody></table></div></div>';
+    content.querySelectorAll('[data-link]').forEach(function (a) { a.addEventListener('click', function (e) { e.preventDefault(); go(a.getAttribute('data-link')); }); });
+    loadSeries(content);
+  }
+  async function loadSeries(content) {
+    var body = content.querySelector('#abSeriesBody');
+    body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('site.loading') + '</td></tr>';
+    var posts = [];
+    try { posts = await listPosts(); } catch (e) { body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; return; }
+    var groups = {};
+    posts.forEach(function (p) {
+      var name = String(p.series || '').trim();
+      if (!name) return;
+      if (!groups[name]) groups[name] = { name: name, posts: [] };
+      groups[name].posts.push(p);
+    });
+    var list = Object.keys(groups).map(function (k) { return groups[k]; }).sort(function (a, b) { return a.name.localeCompare(b.name); });
+    if (!list.length) { body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.series.empty') + '</td></tr>'; return; }
+    body.innerHTML = list.map(function (g) {
+      var orders = g.posts.map(function (p) { return Number(p.seriesOrder) || 0; }).sort(function (a, b) { return a - b; });
+      return '<tr><td><b>' + esc(g.name) + '</b></td><td>' + g.posts.length + '</td><td>' + esc(orders.join(', ')) + '</td>' +
+        '<td class="col-actions"><button class="ab-btn sm" data-series-rename="' + esc(enc(g.name)) + '">' + icon('pen', 12) + ' ' + t('admin.tags.rename') + '</button> ' +
+        '<button class="ab-btn sm danger" data-series-delete="' + esc(enc(g.name)) + '">' + icon('trash', 12) + ' ' + t('admin.comments.delete') + '</button></td></tr>';
+    }).join('');
+    body.querySelectorAll('[data-series-rename]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var oldName = dec(btn.getAttribute('data-series-rename'));
+        var newName = window.prompt(t('admin.series.renamePrompt'), oldName);
+        if (newName == null || !newName.trim() || newName.trim() === oldName) return;
+        updateSeriesPosts(content, oldName, newName.trim());
+      });
+    });
+    body.querySelectorAll('[data-series-delete]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var name = dec(btn.getAttribute('data-series-delete'));
+        confirmModal(t('admin.series.delete'), '<p class="ab-muted">' + t('admin.series.deleteConfirm', { name: esc(name) }) + '</p>', function () { updateSeriesPosts(content, name, ''); }, t('admin.comments.delete'));
+      });
+    });
+  }
+  async function updateSeriesPosts(content, oldName, newName) {
+    var all = [];
+    try { all = await listPosts(); } catch (e) { toast(t('admin.series.updateFail') + (e.message || e), 'err'); return; }
+    var targets = all.filter(function (p) { return String(p.series || '').trim() === oldName; });
+    try {
+      for (var i = 0; i < targets.length; i++) {
+        var full = await getPost(targets[i].id);
+        if (!full) continue;
+        full.series = newName;
+        if (!newName) full.seriesOrder = 0;
+        await savePost(full, false);
+      }
+      toast(t('admin.series.updated'), 'ok');
+      loadSeries(content);
+    } catch (e) { toast(t('admin.series.updateFail') + (e.message || e), 'err'); }
   }
 
   async function pageTags(content) {
@@ -1412,7 +2730,7 @@
     content.innerHTML += '<div class="ab-toolbar">' +
       '<div class="ab-search"><input class="ab-input" id="abCmtKw" placeholder="' + t('admin.comments.search') + '"></div>' +
       '<select class="ab-select" id="abCmtFilter" style="max-width:160px"><option value="all">' + t('admin.comments.all') + '</option><option value="pending"' + (filter === 'pending' ? ' selected' : '') + '>' + t('admin.comments.pendingStatus') + '</option><option value="approved">' + t('admin.comments.approved') + '</option></select>' +
-      '</div><div id="abAiComments" class="ab-ai-comments"></div><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.comments.colAuthor') + '</th><th>' + t('admin.comments.colContent') + '</th><th>' + t('admin.comments.colPost') + '</th><th>' + t('admin.comments.colDate') + '</th><th>' + t('admin.comments.colStatus') + '</th><th class="col-actions">' + t('admin.comments.colActions') + '</th></tr></thead><tbody id="abCmtBody"></tbody></table></div>';
+      '</div><div id="abAiComments" class="ab-ai-comments"></div><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.comments.colAuthor') + '</th><th>' + t('admin.comments.colContent') + '</th><th>' + t('admin.comments.colPost') + '</th><th>' + t('admin.comments.colDate') + '</th><th>' + t('comment.like') + '</th><th>' + t('admin.comments.colStatus') + '</th><th class="col-actions">' + t('admin.comments.colActions') + '</th></tr></thead><tbody id="abCmtBody"></tbody></table></div>';
     bindComments(content);
     loadComments(content, filter);
     initAbAiComments(content);
@@ -1426,18 +2744,19 @@
   async function loadComments(content, filter) {
     var body = content.querySelector('#abCmtBody');
     if (!body) return;
-    body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
     var d;
-    try { d = await api('api/comments?status=' + (filter === 'pending' ? 'pending' : 'all')); } catch (e) { body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; return; }
+    try { d = await api('api/comments?status=' + (filter === 'pending' ? 'pending' : 'all')); } catch (e) { body.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; return; }
     var list = (d && d.comments) || [];
     var kw = (content.querySelector('#abCmtKw').value || '').trim().toLowerCase();
     if (kw) list = list.filter(function (c) { return ((c.author || '') + ' ' + (c.content || '')).toLowerCase().indexOf(kw) >= 0; });
-    if (!list.length) { body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.dashboard.noComments') + '</td></tr>'; return; }
+    if (!list.length) { body.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.dashboard.noComments') + '</td></tr>'; return; }
     // 建立 id → 评论 映射，以便展示“回复了某人”的父子关系
     var cmtById = {};
     list.forEach(function (c) { cmtById[c.id] = c; });
     body.innerHTML = list.map(function (c) {
       var st = c.status || 'approved';
+      var pinned = !!c.pinned, featured = !!c.featured;
       // 二级及以上回复：标注其父评论，便于后台追踪回复链
       var replyTag = '';
       if (c.parent_id) {
@@ -1445,35 +2764,85 @@
         if (parent) replyTag = ' <span class="ab-cmt-replyto">' + esc(t('comment.replyTo', { author: parent.author || t('admin.comments.anonymous') })) + '</span>';
         else replyTag = ' <span class="ab-cmt-replyto">#' + esc(c.parent_id) + '</span>';
       }
+      var badges = '';
+      if (pinned) badges += ' <span class="ab-cmt-badge pinned">' + icon('pin', 11) + t('comment.pinned') + '</span>';
+      if (featured) badges += ' <span class="ab-cmt-badge featured">' + icon('star', 11) + t('comment.featured') + '</span>';
       var actions = '';
       if (st === 'pending') actions += '<button class="ab-btn sm primary" data-approve="' + enc(c.id) + '">' + icon('check', 13) + ' ' + t('admin.comments.approve') + '</button> ';
+      actions += '<button class="ab-btn sm' + (pinned ? ' primary' : '') + '" data-pin="' + enc(c.id) + '" data-on="' + (pinned ? '1' : '0') + '">' + icon('pin', 13) + ' ' + (pinned ? t('comment.unpinComment') : t('comment.pinComment')) + '</button> ';
+      actions += '<button class="ab-btn sm' + (featured ? ' primary' : '') + '" data-feat="' + enc(c.id) + '" data-on="' + (featured ? '1' : '0') + '">' + icon('star', 13) + ' ' + (featured ? t('comment.unfeature') : t('comment.feature')) + '</button> ';
       actions += '<button class="ab-btn sm danger" data-delcmt="' + enc(c.id) + '">' + icon('trash', 13) + ' ' + t('admin.comments.delete') + '</button>';
-      return '<tr>' +
+      return '<tr' + (pinned ? ' class="ab-cmt-pinned"' : '') + '>' +
         '<td>' + esc(c.author || t('admin.comments.anonymous')) + '</td>' +
-        '<td style="max-width:320px">' + esc((c.content || '').slice(0, 120)) + replyTag + '</td>' +
+        '<td style="max-width:320px">' + esc((c.content || '').slice(0, 120)) + replyTag + badges + '</td>' +
         '<td>' + esc(c.post_title || c.post_id || '—') + '</td>' +
         '<td>' + esc(fmtDate(c.date)) + '</td>' +
+        '<td style="text-align:center;white-space:nowrap">' + icon('heart', 12) + ' ' + esc(String(Number(c.likes) || 0)) + '</td>' +
         '<td><span class="ab-status ' + st + '">' + (st === 'pending' ? t('admin.comments.pendingStatus') : t('admin.comments.approved')) + '</span></td>' +
         '<td class="col-actions">' + actions + '</td>' +
       '</tr>';
     }).join('');
     body.querySelectorAll('[data-approve]').forEach(function (b) { b.addEventListener('click', function () { approveComment(content, dec(b.getAttribute('data-approve')), filter, b.closest('tr')); }); });
-    body.querySelectorAll('[data-delcmt]').forEach(function (b) { b.addEventListener('click', function () {
-      var cid = dec(b.getAttribute('data-delcmt'));
-      var tr = b.closest('tr');
-      confirmModal(t('admin.comments.delete'), '<p class="ab-muted">' + t('admin.comments.deleteConfirm') + '</p>', async function () {
-        // 无感刷新：请求期间先半透明即时反馈，成功后行淡出移除，不整表重拉
-        if (tr) { tr.style.opacity = '0.45'; tr.style.pointerEvents = 'none'; }
-        try {
-          await api('api/comments/' + enc(cid), { method: 'DELETE' });
-          toast(t('admin.comments.deleted'), 'ok');
-          seamlessRemoveRow(body, tr, t('admin.dashboard.noComments'));
-        } catch (e) {
-          if (tr) { tr.style.opacity = ''; tr.style.pointerEvents = ''; }
-          toast(t('admin.postList.opFail') + (e.message || e), 'err');
+    body.querySelectorAll('[data-pin]').forEach(function (b) { b.addEventListener('click', function () { toggleCommentFlag(content, b, 'pinned'); }); });
+    body.querySelectorAll('[data-feat]').forEach(function (b) { b.addEventListener('click', function () { toggleCommentFlag(content, b, 'featured'); }); });
+    body.querySelectorAll('[data-delcmt]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var cid = dec(b.getAttribute('data-delcmt'));
+        var tr = b.closest('tr');
+        confirmModal(t('admin.comments.delete'), '<p class="ab-muted">' + t('admin.comments.deleteConfirm') + '</p>', async function () {
+          // 无感刷新：请求期间先半透明即时反馈，成功后行淡出移除，不整表重拉
+          if (tr) { tr.style.opacity = '0.45'; tr.style.pointerEvents = 'none'; }
+          try {
+            await api('api/comments/' + enc(cid), { method: 'DELETE' });
+            toast(t('admin.comments.deleted'), 'ok');
+            seamlessRemoveRow(body, tr, t('admin.dashboard.noComments'));
+          } catch (e) {
+            if (tr) { tr.style.opacity = ''; tr.style.pointerEvents = ''; }
+            toast(t('admin.postList.opFail') + (e.message || e), 'err');
+          }
+        }, t('admin.comments.delete'));
+      });
+    });
+  }
+  // 切换评论置顶 / 精选（就地更新按钮与徽章，不重拉整表）
+  async function toggleCommentFlag(content, btn, key) {
+    var attr = key === 'pinned' ? 'data-pin' : 'data-feat';
+    var cid = dec(btn.getAttribute(attr));
+    var on = btn.getAttribute('data-on') === '1';
+    var target = !on;
+    btn.disabled = true;
+    try {
+      var payload = {};
+      payload[key] = target;
+      await api('api/comments/' + enc(cid), { method: 'PUT', body: JSON.stringify(payload) });
+      btn.setAttribute('data-on', target ? '1' : '0');
+      btn.classList.toggle('primary', target);
+      if (key === 'pinned') {
+        btn.innerHTML = icon('pin', 13) + ' ' + (target ? t('comment.unpinComment') : t('comment.pinComment'));
+      } else {
+        btn.innerHTML = icon('star', 13) + ' ' + (target ? t('comment.unfeature') : t('comment.feature'));
+      }
+      var tr = btn.closest('tr');
+      if (tr) {
+        if (key === 'pinned') tr.classList.toggle('ab-cmt-pinned', target);
+        var cell = tr.cells && tr.cells[1];
+        if (cell) {
+          var badge = cell.querySelector('.ab-cmt-badge.' + key);
+          if (target && !badge) {
+            var span = document.createElement('span');
+            span.className = 'ab-cmt-badge ' + key;
+            span.innerHTML = (key === 'pinned' ? icon('pin', 11) + t('comment.pinned') : icon('star', 11) + t('comment.featured'));
+            cell.appendChild(span);
+          } else if (!target && badge) {
+            badge.remove();
+          }
         }
-      }, t('admin.comments.delete'));
-    }); });
+      }
+    } catch (e) {
+      toast(t('admin.postList.opFail') + (e.message || e), 'err');
+    } finally {
+      btn.disabled = false;
+    }
   }
   async function approveComment(content, cid, filter, tr) {
     // 无感刷新：审核通过后原行状态徽章就地更新为「已通过」，其余行与滚动位置不动
@@ -1493,72 +2862,450 @@
   }
 
   /* ====================== 媒体库 ====================== */
+  var mediaState = { list: [], kw: '', page: 1, per: 24, selected: {} };
   function pageMedia(content) {
-    content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.media.title') + '</h1><p class="ab-page-sub">' + t('admin.media.desc') + '</p></div>' +
+    content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.media.title') + '</h1><p class="ab-page-sub">' + t('admin.media.desc') + '</p><p class="ab-hint" style="margin:6px 0 0">' + t('admin.media.compressHint') + '</p></div>' +
       (cloudOn() ? '<label class="ab-btn primary">' + icon('upload', 15) + ' ' + t('admin.media.upload') + '<input type="file" id="abUpload" accept="image/*" multiple hidden></label>' : '<span class="ab-chip" style="background:var(--ab-primary-weak);color:var(--ab-primary)">' + t('admin.categories.staticHint') + '</span>') + '</div>' +
       (cloudOn() ? '' : '<div class="ab-card"><div class="ab-empty"><div class="ab-empty-ico">🖼</div><p>' + t('admin.media.cloudOnly') + '</p></div></div>');
     if (!cloudOn()) return;
-    content.innerHTML += '<div class="ab-media-grid" id="abMediaGrid"><span class="ab-spin"></span></div>';
+    content.innerHTML += '<div class="ab-toolbar"><div class="ab-search"><input class="ab-input" id="abMediaKw" placeholder="' + t('admin.media.search') + '"></div>' +
+      '<div class="ab-row" style="gap:10px;align-items:center;flex-wrap:wrap"><label class="ab-hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin:0"><input type="checkbox" id="abMediaAll"> ' + t('admin.media.selectAll') + '</label>' +
+      '<span class="ab-muted" id="abMediaSelInfo"></span>' +
+      '<button class="ab-btn danger" id="abMediaBatchDel" disabled>' + icon('trash', 14) + ' ' + t('admin.media.batchDelete') + '</button></div></div>' +
+      '<div class="ab-media-grid" id="abMediaGrid"><span class="ab-spin"></span></div><div class="ab-pagination" id="abMediaPage"></div>';
     var up = content.querySelector('#abUpload');
     up.addEventListener('change', function () { uploadFiles(content, up.files); });
+    var kw = content.querySelector('#abMediaKw');
+    kw.value = mediaState.kw;
+    kw.addEventListener('input', debounce(function () { mediaState.kw = (kw.value || '').trim().toLowerCase(); mediaState.page = 1; renderMediaGrid(content); }, 200));
+    content.querySelector('#abMediaAll').addEventListener('change', function () { toggleSelectAll(content, this.checked); });
+    content.querySelector('#abMediaBatchDel').addEventListener('click', function () { batchDeleteMedia(content); });
+    mediaState.selected = {};
     loadMedia(content);
   }
   async function loadMedia(content) {
     var grid = content.querySelector('#abMediaGrid');
+    if (!grid) return;
     grid.innerHTML = '<span class="ab-spin"></span> ' + t('admin.postList.loading');
     try {
       var d = await api('api/media');
-      var list = (d && d.media) || [];
-      grid.innerHTML = list.length ? list.map(function (m) {
-        return '<div class="ab-media-card">' +
-          '<div class="ab-media-thumb"><img src="' + esc(m.url) + '" alt="' + esc(m.name || '') + '"></div>' +
-          '<div class="ab-media-meta"><div class="ab-media-name">' + esc(m.name || t('admin.media.colImage')) + '</div><div class="ab-media-size">' + fmtSize(m.size) + '</div></div>' +
-          '<div class="ab-media-actions"><button class="ab-btn sm" data-copy="' + enc(m.url) + '">' + t('admin.media.copy') + '</button><button class="ab-btn sm danger" data-delmedia="' + enc(m.id) + '">' + t('admin.media.delete') + '</button></div>' +
-        '</div>';
-      }).join('') : '<div class="ab-card ab-empty"><div class="ab-empty-ico">🖼</div><p>' + t('admin.media.empty') + '</p></div>';
-      grid.querySelectorAll('[data-copy]').forEach(function (b) { b.addEventListener('click', function () { copyText(dec(b.getAttribute('data-copy'))); toast(t('admin.media.copied'), 'ok'); }); });
-      grid.querySelectorAll('[data-delmedia]').forEach(function (b) { b.addEventListener('click', function () {
-        var mid = dec(b.getAttribute('data-delmedia'));
-        confirmModal(t('admin.media.delete'), '<p class="ab-muted">' + t('admin.media.deleteConfirm') + '</p>', async function () {
-          try { await api('api/media/' + enc(mid), { method: 'DELETE' }); toast(t('admin.media.deleted'), 'ok'); loadMedia(content); } catch (e) { toast(t('admin.postList.opFail') + (e.message || e), 'err'); }
-        }, t('admin.comments.delete'));
-      }); });
+      mediaState.list = ((d && d.media) || []).slice();
+      mediaState.selected = {};
+      renderMediaGrid(content);
     } catch (e) { grid.innerHTML = '<div class="ab-empty"><p>' + t('admin.postList.loadFail') + esc(e.message || e) + '</p></div>'; }
   }
+  function mediaFiltered() {
+    var kw = mediaState.kw;
+    if (!kw) return mediaState.list;
+    return mediaState.list.filter(function (m) { return String(m.name || '').toLowerCase().indexOf(kw) >= 0; });
+  }
+  function renderMediaGrid(content) {
+    var grid = content.querySelector('#abMediaGrid');
+    var pg = content.querySelector('#abMediaPage');
+    if (!grid) return;
+    var list = mediaFiltered();
+    var per = mediaState.per;
+    var totalPages = Math.max(1, Math.ceil(list.length / per));
+    if (mediaState.page > totalPages) mediaState.page = totalPages;
+    var page = mediaState.page;
+    var view = list.slice((page - 1) * per, page * per);
+    grid.innerHTML = view.length ? view.map(function (m) {
+      var sel = !!mediaState.selected[m.id];
+      return '<div class="ab-media-card' + (sel ? ' selected' : '') + '">' +
+        '<label class="ab-media-check"><input type="checkbox" data-pick="' + enc(m.id) + '"' + (sel ? ' checked' : '') + '></label>' +
+        '<div class="ab-media-thumb" data-preview="' + enc(m.id) + '" title="' + t('admin.media.preview') + '"><img src="' + esc(m.thumbUrl || m.thumb_url || m.url) + '" alt="' + esc(m.name || '') + '"></div>' +
+        '<div class="ab-media-meta"><div class="ab-media-name">' + esc(m.name || t('admin.media.colImage')) + '</div><div class="ab-media-size">' + fmtSize(m.size) + '</div></div>' +
+        '<div class="ab-media-actions"><button class="ab-btn sm" data-copy="' + enc(m.url) + '">' + t('admin.media.copy') + '</button><button class="ab-btn sm" data-mdimg="' + enc(m.url) + '" data-mdname="' + esc(m.name || '') + '">' + t('admin.media.copyMarkdown') + '</button><button class="ab-btn sm danger" data-delmedia="' + enc(m.id) + '">' + t('admin.media.delete') + '</button></div>' +
+      '</div>';
+    }).join('') : '<div class="ab-card ab-empty" style="grid-column:1/-1"><div class="ab-empty-ico">🖼</div><p>' + (mediaState.kw ? t('admin.media.noMatch') : t('admin.media.empty')) + '</p></div>';
+    if (pg) {
+      pg.innerHTML = list.length > per
+        ? (page > 1 ? '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>' : '') +
+          '<button class="ab-page-btn active">' + page + ' / ' + totalPages + '</button>' +
+          (page < totalPages ? '<button class="ab-page-btn" data-p="' + (page + 1) + '">' + t('pagination.next') + '</button>' : '')
+        : '';
+      pg.querySelectorAll('[data-p]').forEach(function (b) { b.addEventListener('click', function () { mediaState.page = parseInt(b.getAttribute('data-p'), 10) || 1; renderMediaGrid(content); }); });
+    }
+    grid.querySelectorAll('[data-pick]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var id = dec(cb.getAttribute('data-pick'));
+        if (cb.checked) mediaState.selected[id] = true; else delete mediaState.selected[id];
+        var card = cb.closest('.ab-media-card');
+        if (card) card.classList.toggle('selected', cb.checked);
+        syncMediaSelection(content);
+      });
+    });
+    grid.querySelectorAll('[data-copy]').forEach(function (b) { b.addEventListener('click', function () { copyText(dec(b.getAttribute('data-copy'))); toast(t('admin.media.copied'), 'ok'); }); });
+    grid.querySelectorAll('[data-mdimg]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var md = '![' + (b.getAttribute('data-mdname') || '') + '](' + dec(b.getAttribute('data-mdimg')) + ')';
+        copyText(md); toast(t('admin.media.copiedMd'), 'ok');
+      });
+    });
+    grid.querySelectorAll('[data-preview]').forEach(function (el) {
+      el.addEventListener('click', function () { openMediaLightbox(dec(el.getAttribute('data-preview'))); });
+    });
+    grid.querySelectorAll('[data-delmedia]').forEach(function (b) { b.addEventListener('click', function () {
+      var mid = dec(b.getAttribute('data-delmedia'));
+      confirmModal(t('admin.media.delete'), '<p class="ab-muted">' + t('admin.media.deleteConfirm') + '</p>', async function () {
+        try { await api('api/media/' + enc(mid), { method: 'DELETE' }); toast(t('admin.media.deleted'), 'ok'); loadMedia(content); } catch (e) { toast(t('admin.postList.opFail') + (e.message || e), 'err'); }
+      }, t('admin.comments.delete'));
+    }); });
+    syncMediaSelection(content);
+  }
+  var mediaLightbox = { list: [], index: 0, el: null };
+  function ensureMediaLightbox() {
+    if (mediaLightbox.el) return mediaLightbox.el;
+    var el = document.createElement('div');
+    el.className = 'ab-lightbox';
+    el.setAttribute('role', 'dialog');
+    el.setAttribute('aria-modal', 'true');
+    el.innerHTML = '<button type="button" class="ab-lb-close" data-lb="close" aria-label="' + t('lightbox.close') + '">✕</button>' +
+      '<button type="button" class="ab-lb-nav prev" data-lb="prev" aria-label="' + t('lightbox.prev') + '">‹</button>' +
+      '<img class="ab-lb-img" alt="">' +
+      '<button type="button" class="ab-lb-nav next" data-lb="next" aria-label="' + t('lightbox.next') + '">›</button>' +
+      '<div class="ab-lb-counter"></div>';
+    document.body.appendChild(el);
+    el.addEventListener('click', function (e) {
+      var act = (e.target && e.target.getAttribute) ? e.target.getAttribute('data-lb') : '';
+      if (act === 'close' || e.target === el) closeMediaLightbox();
+      else if (act === 'prev') stepMediaLightbox(-1);
+      else if (act === 'next') stepMediaLightbox(1);
+    });
+    document.addEventListener('keydown', function (e) {
+      if (!mediaLightbox.el || !mediaLightbox.el.classList.contains('open')) return;
+      if (e.key === 'Escape') closeMediaLightbox();
+      else if (e.key === 'ArrowLeft') stepMediaLightbox(-1);
+      else if (e.key === 'ArrowRight') stepMediaLightbox(1);
+    });
+    mediaLightbox.el = el;
+    return el;
+  }
+  function openMediaLightbox(id) {
+    var list = mediaFiltered();
+    var idx = -1;
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) idx = i;
+    if (idx < 0) return;
+    mediaLightbox.list = list;
+    mediaLightbox.index = idx;
+    var el = ensureMediaLightbox();
+    el.classList.add('open');
+    showMediaLightbox();
+  }
+  function showMediaLightbox() {
+    var el = mediaLightbox.el;
+    if (!el) return;
+    var item = mediaLightbox.list[mediaLightbox.index];
+    if (!item) return;
+    var img = el.querySelector('.ab-lb-img');
+    if (img) { img.src = item.url || item.thumbUrl || item.thumb_url || ''; img.alt = item.name || ''; }
+    var counter = el.querySelector('.ab-lb-counter');
+    if (counter) counter.textContent = t('lightbox.counter', { current: mediaLightbox.index + 1, total: mediaLightbox.list.length });
+  }
+  function stepMediaLightbox(delta) {
+    var n = mediaLightbox.list.length;
+    if (!n) return;
+    mediaLightbox.index = (mediaLightbox.index + delta + n) % n;
+    showMediaLightbox();
+  }
+  function closeMediaLightbox() {
+    if (mediaLightbox.el) mediaLightbox.el.classList.remove('open');
+  }
+  function syncMediaSelection(content) {
+    var ids = Object.keys(mediaState.selected);
+    var info = content.querySelector('#abMediaSelInfo');
+    var btn = content.querySelector('#abMediaBatchDel');
+    var all = content.querySelector('#abMediaAll');
+    if (info) info.textContent = ids.length ? t('admin.media.selectedItems', { n: ids.length }) : '';
+    if (btn) btn.disabled = ids.length === 0;
+    if (all) {
+      var list = mediaFiltered();
+      all.checked = list.length > 0 && list.every(function (m) { return !!mediaState.selected[m.id]; });
+    }
+  }
+  function toggleSelectAll(content, on) {
+    mediaFiltered().forEach(function (m) { if (on) mediaState.selected[m.id] = true; else delete mediaState.selected[m.id]; });
+    renderMediaGrid(content);
+  }
+  async function batchDeleteMedia(content) {
+    var ids = Object.keys(mediaState.selected);
+    if (!ids.length) return;
+    confirmModal(t('admin.media.batchDelete'), '<p class="ab-muted">' + t('admin.media.batchConfirm', { n: ids.length }) + '</p>', async function () {
+      var ok = 0;
+      for (var i = 0; i < ids.length; i++) {
+        try { await api('api/media/' + enc(ids[i]), { method: 'DELETE' }); ok++; } catch (e) {}
+      }
+      toast(ok ? t('admin.media.batchDeleted', { n: ok }) : t('admin.postList.opFail'), ok ? 'ok' : 'err');
+      mediaState.selected = {};
+      loadMedia(content);
+    }, t('admin.comments.delete'));
+  }
+
   function copyText(t) {
     try { if (navigator.clipboard) navigator.clipboard.writeText(t); else { var ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); } } catch (e) {}
+  }
+  async function uploadImageAsset(file) {
+    var packed = await compressImageFile(file);
+    var mainFile = packed.file;
+    if (mainFile.size > 10 * 1048576) throw new Error(t('admin.media.tooLarge'));
+    var u = await api('api/media/upload-url', { method: 'POST', body: JSON.stringify({ filename: mainFile.name, size: mainFile.size, makeThumb: !!packed.thumb }) });
+    if (!u || !u.uploadUrl) throw new Error((u && u.error) || t('admin.media.uploadFail'));
+    if (!u.publicUrl) throw new Error(t('admin.media.r2Missing'));
+    async function put(url, body, type) {
+      await new Promise(function (resolve, reject) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('PUT', url);
+        xhr.setRequestHeader('Content-Type', type || 'application/octet-stream');
+        xhr.onload = function () {
+          if (xhr.status >= 200 && xhr.status < 300) { resolve(true); return; }
+          reject(new Error('HTTP ' + xhr.status + r2Detail(xhr)));
+        };
+        xhr.onerror = function () { reject(new Error('HTTP 0：预检被拦截 / CORS 或网络中断')); };
+        xhr.send(body);
+      });
+    }
+    await put(u.uploadUrl, mainFile, u.contentType || mainFile.type);
+    if (packed.thumb && u.thumbUploadUrl) await put(u.thumbUploadUrl, packed.thumb, 'image/webp');
+    var registered = await api('api/media', { method: 'POST', body: JSON.stringify({ name: mainFile.name, url: u.publicUrl, thumbUrl: u.thumbPublicUrl || '', type: u.contentType || mainFile.type, size: mainFile.size }) });
+    return { media: registered && registered.media, packed: packed };
   }
   async function uploadFiles(content, files) {
     if (!files || !files.length) return;
     for (var i = 0; i < files.length; i++) {
       var file = files[i];
       if (!/^image\//.test(file.type)) { toast(file.name + ' ' + t('admin.media.notImage'), 'err'); continue; }
-      if (file.size > 10 * 1048576) { toast(file.name + ' ' + t('admin.media.tooLarge'), 'err'); continue; }
+      if (file.size > 30 * 1048576) { toast(file.name + ' ' + t('admin.media.tooLarge'), 'err'); continue; }
       try {
-        // R2 直传（与音乐上传同款）：先取预签名 PUT URL → XHR 直传 R2 → 注册元数据（url 为公开地址）
-        var u = await api('api/media/upload-url', { method: 'POST', body: JSON.stringify({ filename: file.name, size: file.size }) });
-        if (!u || !u.uploadUrl) throw new Error((u && u.error) || t('admin.media.uploadFail'));
-        if (!u.publicUrl) throw new Error(t('admin.media.r2Missing'));
-        var done = await new Promise(function (resolve, reject) {
-          var xhr = new XMLHttpRequest();
-          xhr.open('PUT', u.uploadUrl);
-          xhr.setRequestHeader('Content-Type', u.contentType || file.type || 'application/octet-stream');
-          xhr.onload = function () {
-            if (xhr.status >= 200 && xhr.status < 300) { resolve(true); return; }
-            reject(new Error('HTTP ' + xhr.status + r2Detail(xhr)));
-          };
-          xhr.onerror = function () { reject(new Error('HTTP 0：预检被拦截 / CORS 或网络中断')); };
-          xhr.send(file);
-        });
-        await api('api/media', { method: 'POST', body: JSON.stringify({ name: file.name, url: u.publicUrl, type: u.contentType || file.type, size: file.size }) });
-        toast(t('admin.media.uploaded') + ' ' + file.name, 'ok');
+        toast(t('admin.media.compressing') + ' ' + file.name, 'ok');
+        var result = await uploadImageAsset(file);
+        var saved = result.packed.compressed ? Math.max(0, Math.round((1 - result.packed.file.size / Math.max(1, result.packed.originalSize)) * 100)) : 0;
+        toast(t('admin.media.uploaded') + ' ' + result.packed.file.name + (saved ? ' · ' + t('admin.media.compressed', { percent: saved }) : ''), 'ok');
       } catch (e) { toast(t('admin.media.uploadFail') + (e.message || e), 'err'); }
     }
     loadMedia(content);
   }
 
+  /* ====================== 邮件订阅管理 ====================== */
+  function subscriberStatusLabel(status) {
+    if (status === 'active') return t('admin.subscribers.active');
+    if (status === 'pending') return t('admin.subscribers.pending');
+    return t('admin.subscribers.unsubscribed');
+  }
+  var subState = { list: [], kw: '', status: 'all', page: 1, per: 20 };
+  function pageSubscribers(content) {
+    content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.subscribers.title') + '</h1><p class="ab-page-sub">' + t('admin.subscribers.desc') + '</p></div>' +
+      '<div class="ab-row" style="gap:8px"><button class="ab-btn" id="abSubExport">' + icon('download', 14) + ' ' + t('admin.subscribers.export') + '</button><button class="ab-btn" id="abSubRefresh">' + icon('refresh', 14) + ' ' + t('admin.backup.refresh') + '</button></div></div>' +
+      '<div class="ab-grid cols-3" id="abSubStats"></div><div class="ab-card" id="abSubNotice" style="margin-bottom:16px"></div>' +
+      '<div class="ab-toolbar"><div class="ab-search"><input class="ab-input" id="abSubKw" placeholder="' + t('admin.subscribers.search') + '"></div>' +
+      '<select class="ab-select" id="abSubStatus" style="max-width:170px"><option value="all">' + t('admin.subscribers.filterAll') + '</option><option value="active">' + t('admin.subscribers.active') + '</option><option value="pending">' + t('admin.subscribers.pending') + '</option><option value="unsubscribed">' + t('admin.subscribers.unsubscribed') + '</option></select></div>' +
+      '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.subscribers.colEmail') + '</th><th>' + t('admin.subscribers.colStatus') + '</th><th>' + t('admin.subscribers.colDate') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th></tr></thead><tbody id="abSubBody"></tbody></table></div><div class="ab-pagination" id="abSubPage" style="padding:0 4px 6px"></div></div>';
+    var kw = content.querySelector('#abSubKw');
+    kw.value = subState.kw;
+    kw.addEventListener('input', debounce(function () { subState.kw = (kw.value || '').trim().toLowerCase(); subState.page = 1; renderSubscribers(content); }, 200));
+    var st = content.querySelector('#abSubStatus');
+    st.value = subState.status;
+    st.addEventListener('change', function () { subState.status = st.value; subState.page = 1; renderSubscribers(content); });
+    content.querySelector('#abSubRefresh').addEventListener('click', function () { loadSubscribers(content); });
+    content.querySelector('#abSubExport').addEventListener('click', function () { exportSubscribers(content); });
+    loadSubscribers(content);
+  }
+  async function loadSubscribers(content) {
+    var body = content.querySelector('#abSubBody');
+    body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('site.loading') + '</td></tr>';
+    try {
+      var d = await api('api/admin/subscribers');
+      var counts = (d && d.counts) || { total: 0, active: 0, pending: 0, unsubscribed: 0 };
+      content.querySelector('#abSubStats').innerHTML = [
+        { label: t('admin.subscribers.total'), value: counts.total, icon: 'send' },
+        { label: t('admin.subscribers.active'), value: counts.active, icon: 'check' },
+        { label: t('admin.subscribers.pending'), value: counts.pending, icon: 'clock' }
+      ].map(function (x) { return '<div class="ab-card ab-stat"><div class="ab-stat-label">' + icon(x.icon, 16) + esc(x.label) + '</div><div class="ab-stat-value">' + esc(String(x.value)) + '</div></div>'; }).join('');
+      content.querySelector('#abSubNotice').innerHTML = d && d.enabled ? '<div class="ab-row" style="gap:8px;align-items:center"><span class="ab-chip">' + icon('send', 13) + ' Resend</span><b>' + t('admin.subscribers.enabled') + '</b></div>' : '<div class="ab-row" style="gap:8px;align-items:center"><span class="ab-chip">' + t('admin.backup.disabledChip') + '</span><b>' + t('admin.subscribers.disabled') + '</b><span class="ab-muted">RESEND_API_KEY / BLOG_MAIL_FROM / SITE_URL</span></div>';
+      subState.list = ((d && d.subscribers) || []).slice();
+      renderSubscribers(content);
+    } catch (e) { body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px" class="ab-muted">' + esc(e.message || e) + '</td></tr>'; }
+  }
+  /** 订阅者列表：关键字 + 状态过滤，分页渲染（每页 20） */
+  function filteredSubscribers() {
+    var list = subState.list;
+    if (subState.status !== 'all') list = list.filter(function (s) { return s.status === subState.status; });
+    if (subState.kw) list = list.filter(function (s) { return String(s.email || '').toLowerCase().indexOf(subState.kw) >= 0; });
+    return list;
+  }
+  function renderSubscribers(content) {
+    var body = content.querySelector('#abSubBody');
+    var pg = content.querySelector('#abSubPage');
+    if (!body) return;
+    var list = filteredSubscribers();
+    var per = subState.per;
+    var totalPages = Math.max(1, Math.ceil(list.length / per));
+    if (subState.page > totalPages) subState.page = totalPages;
+    var page = subState.page;
+    var view = list.slice((page - 1) * per, page * per);
+    if (!view.length) {
+      body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:34px" class="ab-muted">' + ((subState.kw || subState.status !== 'all') ? t('admin.subscribers.noMatch') : t('admin.subscribers.empty')) + '</td></tr>';
+    } else {
+      body.innerHTML = view.map(function (sub) {
+        return '<tr><td>' + esc(sub.email) + '</td><td><span class="ab-status ' + (sub.status === 'active' ? 'published' : sub.status === 'pending' ? 'scheduled' : 'draft') + '">' + esc(subscriberStatusLabel(sub.status)) + '</span></td><td>' + esc(fmtTimestamp(sub.created_at)) + '</td><td class="col-actions"><button class="ab-btn sm danger" data-sub-delete="' + esc(sub.id) + '">' + icon('trash', 12) + ' ' + t('admin.comments.delete') + '</button></td></tr>';
+      }).join('');
+      body.querySelectorAll('[data-sub-delete]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var id = btn.getAttribute('data-sub-delete');
+          confirmModal(t('admin.comments.delete'), '<p class="ab-muted">' + t('admin.subscribers.deleteConfirm') + '</p>', async function () {
+            try { await api('api/admin/subscribers/' + enc(id), { method: 'DELETE' }); toast(t('admin.subscribers.deleted'), 'ok'); loadSubscribers(content); }
+            catch (e) { toast(t('admin.subscribers.deleteFail') + (e.message || e), 'err'); }
+          }, t('admin.comments.delete'));
+        });
+      });
+    }
+    if (pg) {
+      pg.innerHTML = list.length > per
+        ? (page > 1 ? '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>' : '') +
+          '<button class="ab-page-btn active">' + page + ' / ' + totalPages + '</button>' +
+          (page < totalPages ? '<button class="ab-page-btn" data-p="' + (page + 1) + '">' + t('pagination.next') + '</button>' : '')
+        : '';
+      pg.querySelectorAll('[data-p]').forEach(function (b) { b.addEventListener('click', function () { subState.page = parseInt(b.getAttribute('data-p'), 10) || 1; renderSubscribers(content); }); });
+    }
+  }
+  async function exportSubscribers(content) {
+    try {
+      // 导出遵循当前搜索 / 状态筛选；未筛选时导出全部
+      var list = subState.list.length ? filteredSubscribers() : ((await api('api/admin/subscribers')).subscribers || []);
+      var rows = [['email', 'status', 'created_at']];
+      list.forEach(function (s) { rows.push([s.email, s.status, s.created_at ? new Date(Number(s.created_at) || 0).toISOString() : '']); });
+      var csv = rows.map(function (r) { return r.map(function (v) { return '"' + String(v).replace(/"/g, '""') + '"'; }).join(','); }).join('\n');
+      transferDownloadText('subscribers-' + transferStamp() + '.csv', '\ufeff' + csv, 'text/csv;charset=utf-8');
+    } catch (e) { toast(t('admin.subscribers.exportFail') + (e.message || e), 'err'); }
+  }
+
+  /* ====================== 备份与恢复 ====================== */
+  function backupReasonLabel(reason) {
+    if (reason === 'auto') return t('admin.backup.reasonAuto');
+    if (reason === 'pre-restore') return t('admin.backup.reasonSafety');
+    return t('admin.backup.reasonManual');
+  }
+  var backupState = { list: [], page: 1, per: 10 };
+  function pageBackups(content) {
+    content.innerHTML =
+      '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.backup.title') + '</h1><p class="ab-page-sub">' + t('admin.backup.desc') + '</p></div>' +
+        '<div class="ab-row" style="gap:8px"><button class="ab-btn" id="abBackupRefresh">' + icon('refresh', 14) + ' ' + t('admin.backup.refresh') + '</button>' +
+        '<button class="ab-btn primary" id="abBackupCreate">' + icon('save', 14) + ' ' + t('admin.backup.create') + '</button></div></div>' +
+      '<div class="ab-card" id="abBackupNotice" style="margin-bottom:16px"></div>' +
+      '<div class="ab-card"><div class="ab-section-title">' + icon('save', 16) + ' ' + t('admin.backup.history') +
+        '<span class="ab-muted" id="abBackupTotal" style="font-weight:400;font-size:12.5px;margin-left:8px"></span></div>' +
+        '<div class="ab-table-wrap" style="margin-top:12px"><table class="ab-table"><thead><tr><th>' + t('admin.backup.colTime') + '</th><th>' + t('admin.backup.colReason') + '</th><th>' + t('admin.backup.colContents') + '</th><th>' + t('admin.backup.colSize') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th></tr></thead><tbody id="abBackupBody"></tbody></table></div><div class="ab-pagination" id="abBackupPage" style="padding:0 4px 6px"></div></div>';
+    content.querySelector('#abBackupRefresh').addEventListener('click', function () { loadBackups(content); });
+    content.querySelector('#abBackupCreate').addEventListener('click', function () { createBackupManual(content); });
+    loadBackups(content);
+  }
+  /** 备份内容摘要：文章 / 评论 / 媒体 / 音乐 / 订阅者 */
+  function backupCountsHtml(counts) {
+    counts = counts || {};
+    var parts = [];
+    if (counts.posts) parts.push(t('admin.backup.cPosts') + ' ' + Number(counts.posts || 0));
+    if (counts.comments) parts.push(t('admin.backup.cComments') + ' ' + Number(counts.comments || 0));
+    if (counts.media) parts.push(t('admin.backup.cMedia') + ' ' + Number(counts.media || 0));
+    if (counts.music) parts.push(t('admin.backup.cMusic') + ' ' + Number(counts.music || 0));
+    if (counts.subscribers) parts.push(t('admin.backup.cSubs') + ' ' + Number(counts.subscribers || 0));
+    return parts.length ? '<span class="ab-muted" style="font-size:12.5px">' + esc(parts.join(' · ')) + '</span>' : '<span class="ab-muted">—</span>';
+  }
+  async function loadBackups(content) {
+    var body = content.querySelector('#abBackupBody');
+    var notice = content.querySelector('#abBackupNotice');
+    body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('site.loading') + '</td></tr>';
+    try {
+      var d = await api('api/admin/backups');
+      var configured = !!(d && d.configured);
+      backupState.list = (d && d.backups) || [];
+      notice.innerHTML = configured
+        ? '<div class="ab-row" style="align-items:center;gap:8px;flex-wrap:wrap"><span class="ab-chip">' + icon('cloud', 13) + ' R2</span><b>' + t('admin.backup.enabled') + '</b><span class="ab-muted">' + t('admin.backup.schedule') + '</span></div>'
+        : '<div class="ab-row" style="align-items:center;gap:8px;flex-wrap:wrap"><span class="ab-chip">' + t('admin.backup.disabledChip') + '</span><b>' + t('admin.backup.disabled') + '</b><span class="ab-muted">' + t('admin.backup.configureHint') + '</span></div>';
+      renderBackups(content);
+    } catch (e) {
+      notice.innerHTML = '<span class="ab-muted">' + esc(t('admin.backup.loadFail') + (e.message || e)) + '</span>';
+      body.innerHTML = '';
+    }
+  }
+  /** 备份列表：分页渲染（每页 10），显示内容摘要 */
+  function renderBackups(content) {
+    var body = content.querySelector('#abBackupBody');
+    var pg = content.querySelector('#abBackupPage');
+    var totalEl = content.querySelector('#abBackupTotal');
+    if (!body) return;
+    var list = backupState.list;
+    if (totalEl) totalEl.textContent = list.length ? t('admin.backup.total', { n: list.length }) : '';
+    var per = backupState.per;
+    var totalPages = Math.max(1, Math.ceil(list.length / per));
+    if (backupState.page > totalPages) backupState.page = totalPages;
+    var page = backupState.page;
+    var view = list.slice((page - 1) * per, page * per);
+    if (!view.length) {
+      body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.backup.empty') + '</td></tr>';
+    } else {
+      body.innerHTML = view.map(function (b) {
+        return '<tr><td>' + esc(fmtTimestamp(b.createdAt)) + '</td><td><span class="ab-chip">' + esc(backupReasonLabel(b.reason)) + '</span></td>' +
+          '<td>' + backupCountsHtml(b.counts) + '</td><td>' + esc(fmtSize(b.size)) + '</td>' +
+          '<td class="col-actions"><button class="ab-btn sm" data-backup-download="' + esc(b.id) + '">' + icon('download', 12) + ' ' + t('admin.backup.download') + '</button> ' +
+          '<button class="ab-btn sm" data-backup-restore="' + esc(b.id) + '">' + icon('refresh', 12) + ' ' + t('admin.backup.restore') + '</button> ' +
+          '<button class="ab-btn sm danger" data-backup-delete="' + esc(b.id) + '">' + icon('trash', 12) + ' ' + t('admin.comments.delete') + '</button></td></tr>';
+      }).join('');
+      body.querySelectorAll('[data-backup-download]').forEach(function (btn) {
+        btn.addEventListener('click', function () { downloadBackup(btn.getAttribute('data-backup-download')); });
+      });
+      body.querySelectorAll('[data-backup-restore]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var id = btn.getAttribute('data-backup-restore');
+          confirmModal(t('admin.backup.restore'), '<p class="ab-muted">' + t('admin.backup.restoreConfirm') + '</p>', async function () {
+            try {
+              btn.disabled = true;
+              await api('api/admin/backups/' + enc(id) + '/restore', { method: 'POST', body: '{}' });
+              toast(t('admin.backup.restored'), 'ok');
+              setTimeout(function () { location.reload(); }, 900);
+            } catch (e) { btn.disabled = false; toast(t('admin.backup.restoreFail') + (e.message || e), 'err'); }
+          }, t('admin.backup.restore'));
+        });
+      });
+      body.querySelectorAll('[data-backup-delete]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var id = btn.getAttribute('data-backup-delete');
+          confirmModal(t('admin.comments.delete'), '<p class="ab-muted">' + t('admin.backup.deleteConfirm') + '</p>', async function () {
+            try { await api('api/admin/backups/' + enc(id), { method: 'DELETE' }); toast(t('admin.backup.deleted'), 'ok'); loadBackups(content); }
+            catch (e) { toast(t('admin.backup.deleteFail') + (e.message || e), 'err'); }
+          }, t('admin.comments.delete'));
+        });
+      });
+    }
+    if (pg) {
+      pg.innerHTML = list.length > per
+        ? (page > 1 ? '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>' : '') +
+          '<button class="ab-page-btn active">' + page + ' / ' + totalPages + '</button>' +
+          (page < totalPages ? '<button class="ab-page-btn" data-p="' + (page + 1) + '">' + t('pagination.next') + '</button>' : '')
+        : '';
+      pg.querySelectorAll('[data-p]').forEach(function (b) { b.addEventListener('click', function () { backupState.page = parseInt(b.getAttribute('data-p'), 10) || 1; renderBackups(content); }); });
+    }
+  }
+  async function createBackupManual(content) {
+    var btn = content.querySelector('#abBackupCreate');
+    var old = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = icon('spinner', 13) + ' ' + t('admin.backup.creating');
+    try {
+      await api('api/admin/backups', { method: 'POST', body: '{}' });
+      toast(t('admin.backup.created'), 'ok');
+      await loadBackups(content);
+    } catch (e) { toast(t('admin.backup.createFail') + (e.message || e), 'err'); }
+    finally { btn.disabled = false; btn.innerHTML = old; }
+  }
+  async function downloadBackup(id) {
+    try {
+      var data = await api('api/admin/backups/' + enc(id));
+      transferDownloadText('qingyu-backup-' + id + '.json', JSON.stringify(data, null, 2), 'application/json;charset=utf-8');
+    } catch (e) { toast(t('admin.backup.downloadFail') + (e.message || e), 'err'); }
+  }
+
   /* ====================== 博客设置 ====================== */
   /* ====================== 音乐管理（R2 直传 + D1 列表） ====================== */
+  var musicState = { list: [], kw: '', page: 1, per: 15 };
   function pageMusic(content) {
     content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.music.title') + '</h1>' +
       '<p class="ab-page-sub">' + t('admin.music.desc') + '</p></div></div>';
@@ -1580,9 +3327,13 @@
         '<div class="ab-progress" id="abMusicBar" style="display:none;height:6px;border-radius:999px;background:var(--ab-border);margin-top:10px;overflow:hidden">' +
           '<div id="abMusicBarFill" style="width:0%;height:100%;background:var(--ab-primary);transition:width .2s"></div></div>' +
       '</div></div>' +
+      '<div class="ab-toolbar"><div class="ab-search"><input class="ab-input" id="abMusicKw" placeholder="' + t('admin.music.search') + '"></div></div>' +
       '<div class="ab-card"><div class="ab-table-wrap ab-music-list"><table class="ab-table"><thead><tr>' +
         '<th>' + t('admin.music.colTitle') + '</th><th>' + t('admin.music.colSize') + '</th><th class="col-actions">' + t('admin.music.colActions') + '</th>' +
-      '</tr></thead><tbody id="abMusicBody"></tbody></table></div></div>');
+      '</tr></thead><tbody id="abMusicBody"></tbody></table></div><div class="ab-pagination" id="abMusicPage" style="padding:0 4px 6px"></div></div>');
+    var mKw = content.querySelector('#abMusicKw');
+    mKw.value = musicState.kw;
+    mKw.addEventListener('input', debounce(function () { musicState.kw = (mKw.value || '').trim().toLowerCase(); musicState.page = 1; renderMusicList(content); }, 200));
     bindMusic(content);
     loadMusic(content);
   }
@@ -1639,28 +3390,48 @@
       body.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:30px" class="ab-muted">' + esc(e.message || e) + '</td></tr>';
       return;
     }
-    var list = (d && d.music) || [];
-    if (!list.length) {
-      body.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.music.empty') + '</td></tr>';
-      return;
-    }
-    body.innerHTML = list.map(function (s) {
-      return '<tr data-mid="' + enc(s.id) + '">' +
-        '<td><div style="display:flex;align-items:center;gap:11px;min-width:0">' +
-          (s.cover ? '<img src="' + esc(s.cover) + '" alt="" style="width:38px;height:38px;border-radius:10px;object-fit:cover;flex:0 0 auto">'
-            : '<span class="ab-cover-ph">' + icon('music', 17) + '</span>') +
-          '<div style="min-width:0"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;font-size:15px;color:var(--ab-text)">' + esc(s.title) + '</div>' +
-          '<div class="ab-muted" style="font-size:12.5px;margin-top:2px">' + esc(s.artist || '—') + '</div></div></div></td>' +
-        '<td class="ab-muted">' + fmtSize(s.size) + '</td>' +
-        '<td class="col-actions"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end">' +
-          '<button type="button" class="ab-play" data-src="' + enc(s.url) + '" title="' + t('player.play') + '">' + icon('play', 14) + '</button>' +
-          '<span class="ab-player-bar" title="' + t('player.seek') + '"><span class="ab-player-fill"></span></span>' +
-          '<span class="ab-player-time ab-muted">0:00</span>' +
-          '<button type="button" class="ab-btn sm" data-act="edit" title="' + t('admin.music.edit') + '">' + icon('pen', 13) + '</button>' +
-          '<button type="button" class="ab-btn sm danger" data-act="del" title="' + t('admin.music.delete') + '">' + icon('trash', 13) + '</button>' +
-        '</div></td>' +
-      '</tr>';
-    }).join('');
+    musicState.list = (d && d.music) || [];
+    renderMusicList(content);
+  }
+  /** 关键字过滤（歌名 + 歌手） */
+  function musicFiltered() {
+    var kw = musicState.kw;
+    if (!kw) return musicState.list;
+    return musicState.list.filter(function (s) {
+      return (String(s.title || '') + ' ' + String(s.artist || '')).toLowerCase().indexOf(kw) >= 0;
+    });
+  }
+  /** 音乐列表：过滤 + 分页（每页 15） */
+  function renderMusicList(content) {
+    var body = content.querySelector('#abMusicBody');
+    var pg = content.querySelector('#abMusicPage');
+    if (!body) return;
+    var list = musicFiltered();
+    var per = musicState.per;
+    var totalPages = Math.max(1, Math.ceil(list.length / per));
+    if (musicState.page > totalPages) musicState.page = totalPages;
+    var page = musicState.page;
+    var view = list.slice((page - 1) * per, page * per);
+    if (!view.length) {
+      body.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:34px" class="ab-muted">' + (musicState.kw ? t('admin.music.noMatch') : t('admin.music.empty')) + '</td></tr>';
+    } else {
+      body.innerHTML = view.map(function (s) {
+        return '<tr data-mid="' + enc(s.id) + '">' +
+          '<td><div style="display:flex;align-items:center;gap:11px;min-width:0">' +
+            (s.cover ? '<img src="' + esc(s.cover) + '" alt="" style="width:38px;height:38px;border-radius:10px;object-fit:cover;flex:0 0 auto">'
+              : '<span class="ab-cover-ph">' + icon('music', 17) + '</span>') +
+            '<div style="min-width:0"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;font-size:15px;color:var(--ab-text)">' + esc(s.title) + '</div>' +
+            '<div class="ab-muted" style="font-size:12.5px;margin-top:2px">' + esc(s.artist || '—') + '</div></div></div></td>' +
+          '<td class="ab-muted">' + fmtSize(s.size) + '</td>' +
+          '<td class="col-actions"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end">' +
+            '<button type="button" class="ab-play" data-src="' + enc(s.url) + '" title="' + t('player.play') + '">' + icon('play', 14) + '</button>' +
+            '<span class="ab-player-bar" title="' + t('player.seek') + '"><span class="ab-player-fill"></span></span>' +
+            '<span class="ab-player-time ab-muted">0:00</span>' +
+            '<button type="button" class="ab-btn sm" data-act="edit" title="' + t('admin.music.edit') + '">' + icon('pen', 13) + '</button>' +
+            '<button type="button" class="ab-btn sm danger" data-act="del" title="' + t('admin.music.delete') + '">' + icon('trash', 13) + '</button>' +
+          '</div></td>' +
+        '</tr>';
+      }).join('');
     body.querySelectorAll('button[data-act]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var tr = btn.closest('tr');
@@ -1669,7 +3440,7 @@
         if (btn.getAttribute('data-act') === 'del') confirmModal(t('admin.music.delete'), esc(t('admin.music.deleteConfirm')), async function () {
           try {
             await api('api/music/' + id, { method: 'DELETE' });
-            loadMusic(content); // 音乐表仅 3 列，不走 seamlessRemoveRow（其按 6 列判断），直接全量刷新
+            loadMusic(content);
             toast(t('admin.music.deleted'), 'ok');
           } catch (e) { toast(esc(e.message || e), 'err'); }
         }, t('admin.music.delete'));
@@ -1677,6 +3448,15 @@
       });
     });
     bindRowPlayers(body);
+  }
+    if (pg) {
+      pg.innerHTML = list.length > per
+        ? (page > 1 ? '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>' : '') +
+          '<button class="ab-page-btn active">' + page + ' / ' + totalPages + '</button>' +
+          (page < totalPages ? '<button class="ab-page-btn" data-p="' + (page + 1) + '">' + t('pagination.next') + '</button>' : '')
+        : '';
+      pg.querySelectorAll('[data-p]').forEach(function (b) { b.addEventListener('click', function () { musicState.page = parseInt(b.getAttribute('data-p'), 10) || 1; renderMusicList(content); }); });
+    }
   }
   /* 行内迷你播放器：单个共享 Audio，同一时刻只播一首；进度条可点击跳转 */
   function fmtTime(sec) {
@@ -1828,6 +3608,11 @@
       copyright: site.copyright || (cfg().footer && cfg().footer.copyrightName) || '',
       footerText: site.footerText || (cfg().footer && cfg().footer.decl) || '',
       about: site.about || '',
+      announceEnabled: !!site.announceEnabled,
+      announceText: site.announceText || '',
+      announceLink: site.announceLink || '',
+      announceLinkText: site.announceLinkText || '',
+      announceClosable: site.announceClosable !== false,
       moderate: s.moderate_comments === '1'
     };
     settingsDraft.profile = {
@@ -1874,6 +3659,11 @@
         name: val(content, '#abSiteName'), desc: val(content, '#abSiteDesc'), avatar: val(content, '#abSiteAvatar'),
         copyright: val(content, '#abFooterCopyright'), footerText: val(content, '#abFooterText'),
         about: val(content, '#abSiteAbout'),
+        announceEnabled: content.querySelector('#abAnnounceEnabled') ? content.querySelector('#abAnnounceEnabled').checked : settingsDraft.site.announceEnabled,
+        announceText: content.querySelector('#abAnnounceText') ? val(content, '#abAnnounceText') : settingsDraft.site.announceText,
+        announceLink: content.querySelector('#abAnnounceLink') ? val(content, '#abAnnounceLink') : settingsDraft.site.announceLink,
+        announceLinkText: content.querySelector('#abAnnounceLinkText') ? val(content, '#abAnnounceLinkText') : settingsDraft.site.announceLinkText,
+        announceClosable: content.querySelector('#abAnnounceClosable') ? content.querySelector('#abAnnounceClosable').checked : settingsDraft.site.announceClosable,
         moderate: content.querySelector('#abModerate') ? content.querySelector('#abModerate').checked : settingsDraft.site.moderate
       };
     }
@@ -1939,6 +3729,11 @@
     if (content.querySelector('#abFooterText')) content.querySelector('#abFooterText').value = site.footerText || '';
     if (content.querySelector('#abSiteAbout')) content.querySelector('#abSiteAbout').value = site.about || '';
     if (content.querySelector('#abModerate')) content.querySelector('#abModerate').checked = !!site.moderate;
+    if (content.querySelector('#abAnnounceEnabled')) content.querySelector('#abAnnounceEnabled').checked = !!site.announceEnabled;
+    if (content.querySelector('#abAnnounceText')) content.querySelector('#abAnnounceText').value = site.announceText || '';
+    if (content.querySelector('#abAnnounceLink')) content.querySelector('#abAnnounceLink').value = site.announceLink || '';
+    if (content.querySelector('#abAnnounceLinkText')) content.querySelector('#abAnnounceLinkText').value = site.announceLinkText || '';
+    if (content.querySelector('#abAnnounceClosable')) content.querySelector('#abAnnounceClosable').checked = site.announceClosable !== false;
     if (content.querySelector('#abProfileName')) content.querySelector('#abProfileName').value = prof.name || '';
     if (content.querySelector('#abProfileBio')) content.querySelector('#abProfileBio').value = prof.bio || '';
     if (content.querySelector('#abProfileAvatar')) content.querySelector('#abProfileAvatar').value = prof.avatar || '';
@@ -1956,6 +3751,12 @@
         '<div class="ab-field"><label class="ab-label">' + t('admin.settings.footerCopyright') + '</label><input class="ab-input" id="abFooterCopyright"></div>' +
         '<div class="ab-field"><label class="ab-label">' + t('admin.settings.footerDecl') + '</label><textarea class="ab-textarea" id="abFooterText" style="min-height:70px"></textarea></div>' +
         '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abModerate"> ' + t('admin.settings.moderateComments') + '</label></div>' +
+        '<div class="ab-section-title" style="margin-top:14px">' + icon('spark', 15) + ' ' + t('admin.settings.announceTitle') + '</div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abAnnounceEnabled"> ' + t('admin.settings.announceEnable') + '</label></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.announceText') + '</label><textarea class="ab-textarea" id="abAnnounceText" style="min-height:60px"></textarea></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.announceLink') + '</label><input class="ab-input" id="abAnnounceLink" placeholder="/about"></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.announceLinkText') + '</label><input class="ab-input" id="abAnnounceLinkText"></div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abAnnounceClosable"> ' + t('admin.settings.announceClosable') + '</label></div>' +
       '</div>';
     } else if (tab === 'profile') {
       body.innerHTML = '<div class="ab-card" style="max-width:620px">' +
@@ -2034,7 +3835,10 @@
     var payload = {
       site_info: {
         name: site.name || '', desc: site.desc || '', avatar: site.avatar || '',
-        copyright: site.copyright || '', footerText: site.footerText || '', about: site.about || ''
+        copyright: site.copyright || '', footerText: site.footerText || '', about: site.about || '',
+        announceEnabled: !!site.announceEnabled, announceText: site.announceText || '',
+        announceLink: site.announceLink || '', announceLinkText: site.announceLinkText || '',
+        announceClosable: site.announceClosable !== false
       },
       profile: {
         name: prof.name || '', bio: prof.bio || '', avatar: prof.avatar || '', email: prof.email || ''
@@ -2173,7 +3977,29 @@
   }
 
   /* ----------------------- 导出 ----------------------- */
-  window.QingyuAdmin = { mount: mount, openPwdModal: openPasswordModal };
+  if (!window.__qyOfflineSyncBound) {
+    window.__qyOfflineSyncBound = true;
+    window.addEventListener('online', function () { flushOfflineQueue(false); });
+  }
+  if (cloudOn()) flushOfflineQueue(true);
+
+  window.QingyuAdmin = {
+    mount: mount,
+    openPwdModal: openPasswordModal,
+    _transfer: {
+      postToMarkdown: transferPostMarkdown,
+      parseMarkdown: transferParseMarkdown,
+      parseJson: transferParseJson,
+      backup: transferBackupJson,
+      zip: transferZipForPosts
+    },
+    _offline: { read: readOfflineQueue, queue: queueOfflinePost, flush: flushOfflineQueue, isNetworkFailure: isNetworkFailure },
+    _editor: {
+      toDateTimeLocal: toDateTimeLocal,
+      normalizeEditorDate: normalizeEditorDate,
+      fmtPostDate: fmtPostDate
+    }
+  };
 
   /* app.js 先于本脚本执行时，初次 route() 因 QingyuAdmin 尚未定义而走了旧后台渲染。
    * 本脚本加载完成后，若当前已在后台路由，重新分发一次路由以挂载新版后台 UI。 */

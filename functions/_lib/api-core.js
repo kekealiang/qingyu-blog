@@ -140,22 +140,35 @@ export function unauthorized(request, env) {
   return json({ error: '未授权：请先登录获取会话 token，并在请求头携带 Authorization: Bearer <token>' }, 401, request, env);
 }
 
+function normalizePostStatus(v) {
+  return v === 'draft' || v === 'scheduled' ? v : 'published';
+}
+function normalizePublishAt(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
 export function normalizePost(p) {
   const out = p || {};
   const protectedPost = !!out.protected && out.enc && typeof out.enc === 'object';
+  const status = normalizePostStatus(out.status);
+  const publishAt = status === 'scheduled' ? normalizePublishAt(out.publishAt !== undefined ? out.publishAt : out.publish_at) : null;
   return {
     id: String(out.id || ''),
     title: String(out.title || '').trim(),
     date: String(out.date || ''),
     excerpt: String(out.excerpt || '').trim(),
     cover: String(out.cover || '').trim(),
+    ogImage: String(out.ogImage || out.og_image || '').trim().slice(0, 1000),
     // 加密文章：正文存于 enc（AES-GCM 密文），content 恒为空，避免明文外泄
     content: protectedPost ? '' : String(out.content || ''),
     pinned: !!out.pinned,
     protected: !!out.protected,
     enc: protectedPost ? out.enc : null,
     category: String(out.category || '').trim(),
-    status: (out.status === 'draft') ? 'draft' : 'published',
+    series: String(out.series || '').trim().slice(0, 80),
+    seriesOrder: Math.max(0, Math.floor(Number(out.seriesOrder || out.series_order) || 0)),
+    status: status,
+    publishAt: publishAt,
     tags: Array.isArray(out.tags)
       ? out.tags.map((t) => String(t).trim()).filter(Boolean)
       : String(out.tags || '').split(/[,，]/).map((t) => t.trim()).filter(Boolean)
@@ -179,12 +192,16 @@ function postFromRow(r) {
     date: String(r.date || ''),
     excerpt: String(r.excerpt || ''),
     cover: String(r.cover || ''),
+    ogImage: String(r.og_image || ''),
     content: isProtected ? '' : String(r.content || ''),
     pinned: !!r.pinned,
     protected: isProtected,
     enc: enc,
     category: String(r.category || ''),
-    status: (r.status === 'draft') ? 'draft' : 'published',
+    series: String(r.series || ''),
+    seriesOrder: Number(r.series_order) || 0,
+    status: normalizePostStatus(r.status),
+    publishAt: normalizePublishAt(r.publish_at),
     tags: tags
   };
 }
@@ -194,12 +211,20 @@ function postToParams(p) {
   return [
     p.id, p.title, p.date, p.excerpt, p.content,
     p.cover || '',
+    p.ogImage || '',
     p.pinned ? 1 : 0, p.protected ? 1 : 0,
     p.enc ? JSON.stringify(p.enc) : null,
     JSON.stringify(p.tags || []),
     p.category || '',
-    p.status === 'draft' ? 'draft' : 'published'
+    p.series || '',
+    p.seriesOrder || 0,
+    normalizePostStatus(p.status),
+    p.status === 'scheduled' ? normalizePublishAt(p.publishAt) : null
   ];
+}
+
+function isPublicPost(p) {
+  return (p && (p.status || 'published')) === 'published';
 }
 
 function sortByDateDesc(posts) {
@@ -237,7 +262,7 @@ export function buildFeedXml(posts, siteUrl, opts) {
   const base = String(siteUrl || '').replace(/\/+$/, '');
   const title = o.title || '轻语博客';
   const desc = o.description || '一个零依赖的轻量博客';
-  const list = sortByDateDesc(posts).filter((p) => !p.protected && p.status !== 'draft').slice(0, o.maxItems || 20);
+  const list = sortByDateDesc(posts).filter((p) => !p.protected && isPublicPost(p)).slice(0, o.maxItems || 20);
   const items = list.map((p) => {
     const link = base + '/posts/' + encodeURIComponent(p.id) + '/';
     const content = p.content || '';
@@ -317,33 +342,48 @@ async function readStaticPosts(env) {
 export async function handlePosts(request, env) {
   if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
   if (request.method === 'OPTIONS') return corsPreflight(request, env);
-  if (request.method === 'POST' && !(await isWriteAuthed(request, env))) return unauthorized(request, env);
 
   if (request.method === 'GET') {
-    // 列表只返回已发布文章的摘要（不含 content/enc），草稿不对外暴露；
-    // 正文按需通过 /api/posts/:id 加载；非加密文章附带 search 字段供前端搜索使用。
-    const all = sortByDateDesc(await readPosts(env)).filter((p) => p.status !== 'draft');
+    const url = new URL(request.url);
+    const full = url.searchParams.get('full') === '1';
+    const includeDrafts = full || url.searchParams.get('all') === '1';
+
+    // all=1 / full=1 是后台接口：必须登录，可返回草稿（full=1 还返回正文）。
+    // 公开的 GET /api/posts 仍只返回已发布摘要，且响应不区分管理员身份。
+    if (includeDrafts && !(await isWriteAuthed(request, env))) return unauthorized(request, env);
+
+    let all = sortByDateDesc(await readPosts(env));
+    if (!includeDrafts) all = all.filter(isPublicPost);
+
+    // 完整备份：正文/密文原样返回，禁止写进共享缓存。
+    if (full) return json({ ok: true, posts: all }, 200, request, env, { 'Cache-Control': NO_CACHE });
+
     const summary = all.map((p) => {
       if (!p.protected) {
-        const s = String(p.content || '');
-        if (s) p.search = s.slice(0, 800);
+        const content = String(p.content || '');
+        if (content) p.search = content.slice(0, 800);
       }
       delete p.content;
       delete p.enc;
       return p;
     });
-    return json({ ok: true, posts: summary }, 200, request, env, { 'Cache-Control': READ_CACHE, 'Cache-Tag': TAG_POSTS });
+    return json({ ok: true, posts: summary }, 200, request, env,
+      includeDrafts ? { 'Cache-Control': NO_CACHE } : { 'Cache-Control': READ_CACHE, 'Cache-Tag': TAG_POSTS });
   }
 
   if (request.method === 'POST') {
+    if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
     const body = await request.json().catch(() => null);
     const p = normalizePost(body);
     if (!p.id || !p.title) return json({ error: '缺少 id 或 title' }, 400, request, env);
+    if (p.status === 'scheduled' && !p.publishAt) return json({ error: '定时发布缺少发布时间' }, 400, request, env);
     const exist = await dbFirst(env.DB, 'SELECT 1 FROM posts WHERE id = ?', p.id);
     if (exist) return json({ error: '已存在相同 id（' + p.id + '），请用 PUT 更新' }, 409, request, env);
     await dbRun(env.DB,
-      'INSERT INTO posts (id,title,date,excerpt,content,cover,pinned,protected,enc,tags,category,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO posts (id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,series_order,status,publish_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       ...postToParams(p));
+    await recordPostRevision(env, p, 'create').catch(() => {});
+    if ((p.status || 'published') === 'published') await queuePostNotifications(env, p).catch(() => {});
     await purgeTags(env, [TAG_POSTS, TAG_FEED, TAG_SITEMAP, 'post:' + p.id]);
     return json({ ok: true, post: p }, 201, request, env);
   }
@@ -363,7 +403,7 @@ export async function handlePostId(request, env, id) {
     const p = exist ? postFromRow(exist) : null;
     if (!p) return json({ error: '未找到该内容' }, 404, request, env);
     // 草稿只对作者可见：未登录（无写权限）时对外不可读，避免草稿全文泄漏
-    if (p.status === 'draft' && !(await isWriteAuthed(request, env))) {
+    if ((p.status === 'draft' || p.status === 'scheduled') && !(await isWriteAuthed(request, env))) {
       return json({ error: '未找到该内容' }, 404, request, env);
     }
     // 单篇详情可稍长缓存（含正文/密文），写操作会使缓存自然过期
@@ -375,9 +415,14 @@ export async function handlePostId(request, env, id) {
     const p = normalizePost(body);
     p.id = id;
     if (!p.title) return json({ error: '缺少 title' }, 400, request, env);
+    if (p.status === 'scheduled' && !p.publishAt) return json({ error: '定时发布缺少发布时间' }, 400, request, env);
     await dbRun(env.DB,
-      'INSERT OR REPLACE INTO posts (id,title,date,excerpt,content,cover,pinned,protected,enc,tags,category,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO posts (id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,series_order,status,publish_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
+      'ON CONFLICT(id) DO UPDATE SET title=excluded.title,date=excluded.date,excerpt=excluded.excerpt,content=excluded.content,cover=excluded.cover,og_image=excluded.og_image,pinned=excluded.pinned,protected=excluded.protected,enc=excluded.enc,tags=excluded.tags,category=excluded.category,series=excluded.series,series_order=excluded.series_order,status=excluded.status,publish_at=excluded.publish_at',
       ...postToParams(p));
+    await recordPostRevision(env, p, 'update').catch(() => {});
+    const oldStatus = exist ? normalizePostStatus(exist.status) : '';
+    if (oldStatus !== 'published' && (p.status || 'published') === 'published') await queuePostNotifications(env, p).catch(() => {});
     await purgeTags(env, [TAG_POSTS, TAG_FEED, TAG_SITEMAP, 'post:' + id]);
     return json({ ok: true, post: p }, 200, request, env);
   }
@@ -405,7 +450,7 @@ export async function handlePostId(request, env, id) {
  * 评论（D1 表 comments；GET 列表 / POST 发表 / DELETE 单条）
  * ============================================================ */
 
-const COMMENT_CAPS = { author: 30, content: 1000, perPost: 300, perMin: 5 };
+const COMMENT_CAPS = { author: 30, content: 1000, perPost: 300, perMin: 5, likePerMin: 30 };
 
 /** 清除字符串中的 ASCII 控制字符（保留 \n \t）：防注入 / 干扰渲染的隐形字符 */
 function sanitizeText(s) {
@@ -434,7 +479,7 @@ export async function handleComments(request, env, postId) {
   if (method === 'GET') {
     // 按写入顺序返回（rowid 单调递增），与旧版 KV 行为一致；
     // 仅返回已通过审核的评论（status 缺失视为已通过，兼容旧数据）。
-    const list = await dbAll(env.DB, "SELECT * FROM comments WHERE post_id = ? AND (status = 'approved' OR status IS NULL) ORDER BY rowid ASC", postId);
+    const list = await dbAll(env.DB, "SELECT *, rowid AS rid FROM comments WHERE post_id = ? AND (status = 'approved' OR status IS NULL) ORDER BY COALESCE(pinned,0) DESC, COALESCE(featured,0) DESC, COALESCE(likes,0) DESC, rowid ASC", postId);
     // 评论是用户实时互动内容、变化频繁，不进边缘缓存（no-store），
     // 保证发表/删除后立即可见；否则命中 60s 缓存会导致删除"不刷新"。
     return json({ ok: true, postId, comments: list }, 200, request, env, { 'Cache-Control': NO_CACHE });
@@ -511,6 +556,7 @@ export async function handleComments(request, env, postId) {
     await dbRun(env.DB,
       'INSERT INTO comments (id,post_id,author,content,date,status,parent_id) VALUES (?,?,?,?,?,?,?)',
       comment.id, postId, comment.author, comment.content, comment.date, comment.status, parentId);
+    await queueCommentNotification(env, postId, comment).catch(() => {});
     // 入库成功才计数（防刷屏）
     if (env.BLOG) {
       try { await env.BLOG.put(rk, String(cnt + 1), { expirationTtl: 120 }); } catch (e) {}
@@ -522,6 +568,26 @@ export async function handleComments(request, env, postId) {
   return json({ error: 'Method not allowed' }, 405, request, env);
 }
 
+/** POST /api/comments/:id/like（公开点赞，按 IP 频控） */
+export async function handleCommentLike(request, env, cid) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
+  const exist = await dbFirst(env.DB, 'SELECT likes FROM comments WHERE id = ?', cid).catch(() => null);
+  if (!exist) return json({ error: '评论不存在' }, 404, request, env);
+  const ip = clientIp(request);
+  const win = Math.floor(Date.now() / 60000);
+  const key = 'rate:cmtlike:' + ip + ':' + win;
+  if (env.BLOG) {
+    let n = 0;
+    try { n = Number((await env.BLOG.get(key)) || 0); } catch (e) {}
+    if (n >= COMMENT_CAPS.likePerMin) return json({ error: '点赞太频繁，请稍后再试' }, 429, request, env);
+    try { await env.BLOG.put(key, String(n + 1), { expirationTtl: 120 }); } catch (e) {}
+  }
+  await dbRun(env.DB, 'UPDATE comments SET likes = MIN(COALESCE(likes,0) + 1, 999999) WHERE id = ?', cid);
+  const row = await dbFirst(env.DB, 'SELECT likes FROM comments WHERE id = ?', cid);
+  return json({ ok: true, likes: Number(row && row.likes) || 0 }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
 /** DELETE /api/posts/:id/comments/:cid（需写入令牌，用于管理/删除不当评论） */
 export async function handleCommentId(request, env, postId, cid) {
   if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
@@ -533,6 +599,178 @@ export async function handleCommentId(request, env, postId, cid) {
   if (!exist) return json({ error: '评论不存在' }, 404, request, env);
   await dbRun(env.DB, 'DELETE FROM comments WHERE post_id = ? AND id = ?', postId, cid);
   return json({ ok: true }, 200, request, env);
+}
+
+/** 将新评论加入站长通知发件箱；未配置收件邮箱或邮件服务时静默跳过。 */
+async function queueCommentNotification(env, postId, comment) {
+  if (!env || !env.DB || !env.RESEND_API_KEY || !env.BLOG_MAIL_FROM || !env.SITE_URL) return false;
+  let to = String(env.BLOG_ADMIN_EMAIL || env.BLOG_MAIL_REPLY_TO || '').trim();
+  if (!to) {
+    try {
+      const row = await dbFirst(env.DB, "SELECT v FROM site_settings WHERE k = 'profile'");
+      const profile = row && row.v ? JSON.parse(row.v) : {};
+      to = String(profile.email || '').trim();
+    } catch (e) {}
+  }
+  if (!to) to = String(env.BLOG_MAIL_FROM || '').trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return false;
+  const post = await dbFirst(env.DB, 'SELECT title FROM posts WHERE id = ?', postId).catch(() => null);
+  const payload = JSON.stringify({ postId: postId, postTitle: post ? post.title : '', author: comment.author, content: comment.content, status: comment.status, commentId: comment.id });
+  await dbRun(env.DB, 'INSERT INTO mail_outbox (post_id,to_email,status,attempts,error,created_at,kind,payload) VALUES (?,?,?,?,?,?,?,?)', postId, to, 'pending', 0, '', Date.now(), 'comment', payload);
+  return true;
+}
+/** 将已发布文章加入订阅通知发件箱；发送由 Cron 异步完成。 */
+export async function queuePostNotifications(env, post) {
+  if (!env || !env.DB || !post || !post.id || (post.status || 'published') !== 'published') return { queued: 0 };
+  const subscribers = await dbAll(env.DB, "SELECT email FROM subscribers WHERE status = 'active'").catch(() => []);
+  if (!subscribers.length) return { queued: 0 };
+  const now = Date.now();
+  const stmts = subscribers.map((row) => ({
+    sql: 'INSERT OR IGNORE INTO mail_outbox (post_id,to_email,status,attempts,error,created_at) VALUES (?,?,?,?,?,?)',
+    params: [post.id, row.email, 'pending', 0, '', now]
+  }));
+  for (let i = 0; i < stmts.length; i += 100) await dbBatch(env.DB, stmts.slice(i, i + 100));
+  return { queued: subscribers.length };
+}
+
+/* ============================================================
+ * 文章版本历史
+ * ============================================================ */
+function revisionFromRow(r) {
+  if (!r) return null;
+  let tags = [];
+  try { tags = r.tags ? JSON.parse(r.tags) : []; } catch (e) { tags = []; }
+  let enc = null;
+  if (r.enc) { try { enc = JSON.parse(r.enc); } catch (e) { enc = null; } }
+  return {
+    id: Number(r.id) || 0,
+    postId: String(r.post_id || ''),
+    title: String(r.title || ''),
+    date: String(r.date || ''),
+    excerpt: String(r.excerpt || ''),
+    content: String(r.content || ''),
+    cover: String(r.cover || ''),
+    ogImage: String(r.og_image || ''),
+    pinned: !!r.pinned,
+    protected: !!r.protected,
+    enc: enc,
+    tags: tags,
+    category: String(r.category || ''),
+    series: String(r.series || ''),
+    seriesOrder: Number(r.series_order) || 0,
+    status: normalizePostStatus(r.status),
+    publishAt: normalizePublishAt(r.publish_at),
+    reason: String(r.reason || 'save'),
+    createdAt: Number(r.created_at) || 0
+  };
+}
+function revisionMetaFromRow(r) {
+  const rev = revisionFromRow(r);
+  if (!rev) return null;
+  delete rev.content;
+  delete rev.enc;
+  return rev;
+}
+function revisionFingerprint(post) {
+  return JSON.stringify([
+    post.title || '', post.date || '', post.excerpt || '', post.content || '', post.cover || '', post.ogImage || '',
+    post.pinned ? 1 : 0, post.protected ? 1 : 0, post.enc || null,
+    post.tags || [], post.category || '', post.series || '', Number(post.seriesOrder) || 0,
+    normalizePostStatus(post.status), post.publishAt || null
+  ]);
+}
+async function recordPostRevision(env, post, reason) {
+  if (!env || !env.DB || !post || !post.id) return;
+  const last = await dbFirst(env.DB,
+    'SELECT * FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC, id DESC LIMIT 1',
+    post.id);
+  if (last && revisionFingerprint(revisionFromRow(last)) === revisionFingerprint(post)) return;
+  const createdAt = Date.now();
+  await dbRun(env.DB,
+    'INSERT INTO post_revisions (post_id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,series_order,status,publish_at,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    post.id, post.title || '', post.date || '', post.excerpt || '', post.content || '', post.cover || '', post.ogImage || '',
+    post.pinned ? 1 : 0, post.protected ? 1 : 0, post.enc ? JSON.stringify(post.enc) : null,
+    JSON.stringify(post.tags || []), post.category || '', post.series || '', Number(post.seriesOrder) || 0,
+    normalizePostStatus(post.status), post.status === 'scheduled' ? normalizePublishAt(post.publishAt) : null,
+    reason || 'save', createdAt);
+  // Each post keeps at most 50 revisions, newest first.
+  const rows = await dbAll(env.DB, 'SELECT id FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC, id DESC', post.id).catch(() => []);
+  for (const row of rows.slice(50)) {
+    await dbRun(env.DB, 'DELETE FROM post_revisions WHERE id = ?', row.id).catch(() => {});
+  }
+}
+
+export async function handlePostRevisions(request, env, postId) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  if (request.method !== 'GET') return json({ error: 'Method not allowed' }, 405, request, env);
+  const rows = await dbAll(env.DB,
+    'SELECT id,post_id,title,date,excerpt,cover,og_image,pinned,protected,tags,category,series,series_order,status,publish_at,reason,created_at FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC, id DESC',
+    postId).catch(() => []);
+  return json({ ok: true, revisions: rows.map(revisionMetaFromRow).filter(Boolean) }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+
+export async function handlePostRevision(request, env, postId, revisionId) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  if (request.method !== 'GET') return json({ error: 'Method not allowed' }, 405, request, env);
+  const row = await dbFirst(env.DB,
+    'SELECT * FROM post_revisions WHERE post_id = ? AND id = ?', postId, Number(revisionId));
+  const revision = revisionFromRow(row);
+  if (!revision) return json({ error: '版本不存在' }, 404, request, env);
+  return json({ ok: true, revision: revision }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+
+export async function handlePostRevisionRestore(request, env, postId, revisionId) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  const row = await dbFirst(env.DB,
+    'SELECT * FROM post_revisions WHERE post_id = ? AND id = ?', postId, Number(revisionId));
+  const revision = revisionFromRow(row);
+  if (!revision) return json({ error: '版本不存在' }, 404, request, env);
+  const currentRow = await dbFirst(env.DB, 'SELECT * FROM posts WHERE id = ?', postId);
+  const current = postFromRow(currentRow);
+  if (current) await recordPostRevision(env, current, 'update');
+  const post = {
+    id: postId, title: revision.title, date: revision.date, excerpt: revision.excerpt,
+    content: revision.content, cover: revision.cover, ogImage: revision.ogImage,
+    pinned: revision.pinned, protected: revision.protected, enc: revision.enc, tags: revision.tags,
+    category: revision.category, series: revision.series, seriesOrder: revision.seriesOrder,
+    status: revision.status, publishAt: revision.publishAt
+  };
+  await dbRun(env.DB,
+    'INSERT INTO posts (id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,series_order,status,publish_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
+    'ON CONFLICT(id) DO UPDATE SET title=excluded.title,date=excluded.date,excerpt=excluded.excerpt,content=excluded.content,cover=excluded.cover,og_image=excluded.og_image,pinned=excluded.pinned,protected=excluded.protected,enc=excluded.enc,tags=excluded.tags,category=excluded.category,series=excluded.series,series_order=excluded.series_order,status=excluded.status,publish_at=excluded.publish_at',
+    ...postToParams(post));
+  await recordPostRevision(env, post, 'restore');
+  await purgeTags(env, [TAG_POSTS, TAG_FEED, TAG_SITEMAP, 'post:' + postId]);
+  return json({ ok: true, post: post }, 200, request, env);
+}
+
+/* ============================================================
+ * 定时发布（由 Worker Cron Trigger 周期调用）
+ * ============================================================ */
+export async function publishScheduledPosts(env, nowMs) {
+  if (!env || !env.DB) return { published: 0, ids: [] };
+  const now = Number(nowMs) || Date.now();
+  const due = await dbAll(env.DB,
+    "SELECT * FROM posts WHERE status = 'scheduled' AND publish_at IS NOT NULL AND publish_at <= ?",
+    now).catch(() => []);
+  if (!due.length) return { published: 0, ids: [] };
+  await dbBatch(env.DB, due.map((row) => ({
+    sql: "UPDATE posts SET status = 'published', publish_at = NULL WHERE id = ? AND status = 'scheduled'",
+    params: [row.id]
+  })));
+  await purgeTags(env, [TAG_POSTS, TAG_FEED, TAG_SITEMAP].concat(due.map((row) => 'post:' + row.id)));
+  for (const row of due) {
+    const post = postFromRow(row);
+    if (post) { post.status = 'published'; post.publishAt = null; await queuePostNotifications(env, post).catch(() => {}); }
+  }
+  return { published: due.length, ids: due.map((row) => String(row.id)) };
 }
 
 /* ============================================================
@@ -555,7 +793,7 @@ export function buildSitemapXml(posts, siteUrl) {
     row(base + '/archive'),
     row(base + '/guestbook')
   ];
-  sortByDateDesc(posts).filter((p) => p.status !== 'draft').forEach((p) => {
+  sortByDateDesc(posts).filter(isPublicPost).forEach((p) => {
     lines.push(row(base + '/posts/' + encodeURIComponent(p.id) + '/', p.date || ''));
   });
   lines.push('</urlset>');
@@ -1151,12 +1389,24 @@ export async function handleCommentUpdate(request, env, cid) {
   if (request.method === 'OPTIONS') return corsPreflight(request, env);
   if (request.method !== 'PUT' && request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
   if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
-  const body = await request.json().catch(() => null);
-  const status = (body && body.status) || 'approved';
-  if (status !== 'approved' && status !== 'pending') return json({ error: 'status 只能是 approved 或 pending' }, 400, request, env);
+  const body = (await request.json().catch(() => null)) || {};
+  const fields = [];
+  const params = [];
+  if (Object.prototype.hasOwnProperty.call(body, 'status')) {
+    if (body.status !== 'approved' && body.status !== 'pending') return json({ error: 'status 只能是 approved 或 pending' }, 400, request, env);
+    fields.push('status = ?'); params.push(body.status);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'featured')) {
+    fields.push('featured = ?'); params.push(body.featured ? 1 : 0);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'pinned')) {
+    fields.push('pinned = ?'); params.push(body.pinned ? 1 : 0);
+  }
+  if (!fields.length) return json({ error: '缺少要更新的字段' }, 400, request, env);
   const exist = await dbFirst(env.DB, 'SELECT post_id FROM comments WHERE id = ?', cid);
   if (!exist) return json({ error: '评论不存在' }, 404, request, env);
-  await dbRun(env.DB, 'UPDATE comments SET status = ? WHERE id = ?', status, cid);
+  params.push(cid);
+  await dbRun(env.DB, 'UPDATE comments SET ' + fields.join(', ') + ' WHERE id = ?', ...params);
   return json({ ok: true }, 200, request, env);
 }
 
@@ -1204,9 +1454,10 @@ export async function handleMedia(request, env) {
     const name = String((body && body.name) || id).slice(0, 200);
     const type = String((body && body.type) || '').slice(0, 64);
     const size = Number((body && body.size) || 0) || 0;
+    const thumbUrl = String((body && body.thumbUrl) || '').trim();
     const created_at = new Date().toISOString().slice(0, 10);
-    await dbRun(env.DB, 'INSERT INTO media (id,name,url,type,size,created_at) VALUES (?,?,?,?,?,?)', id, name, url, type, size, created_at);
-    return json({ ok: true, media: { id, name, url, type, size, created_at } }, 201, request, env, { 'Cache-Control': NO_CACHE });
+    await dbRun(env.DB, 'INSERT INTO media (id,name,url,thumb_url,type,size,created_at) VALUES (?,?,?,?,?,?,?)', id, name, url, thumbUrl, type, size, created_at);
+    return json({ ok: true, media: { id, name, url, thumbUrl, type, size, created_at } }, 201, request, env, { 'Cache-Control': NO_CACHE });
   }
   return json({ error: 'Method not allowed' }, 405, request, env);
 }

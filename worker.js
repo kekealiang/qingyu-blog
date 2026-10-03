@@ -6,12 +6,19 @@
  *   · 其余请求 → 静态资源（由 wrangler.workers.toml [assets] 绑定提供）
  * 部署：npx wrangler deploy
  * ============================================================ */
-import { handlePosts, handlePostId, handleFeed, handleComments, handleCommentId, handleSitemap, handleSiteFiles, handleStats, handleAdminSetup, handleAdminLogin, handleAdminLogout, getCorsHeaders, securityHeaders, handleCommentsList, handleCommentUpdate, handleCommentDeleteGlobal, handleMedia, handleMediaId, handleSettings, handleAdminPassword, handleStatsTrend, dbFirst } from './functions/_lib/api-core.js';
+import { handleSearch } from './functions/_lib/search.js';
+import { handlePostRelations } from './functions/_lib/relations.js';
+import { handlePopular } from './functions/_lib/popular.js';
+import { handlePostAnalytics } from './functions/_lib/analytics.js';
+import { handlePosts, handlePostId, handleFeed, handleComments, handleCommentId, handleSitemap, handleSiteFiles, handleStats, handleAdminSetup, handleAdminLogin, handleAdminLogout, getCorsHeaders, securityHeaders, handleCommentsList, handleCommentUpdate, handleCommentDeleteGlobal, handleCommentLike, handleMedia, handleMediaId, handleSettings, handleAdminPassword, handleStatsTrend, publishScheduledPosts, handlePostRevisions, handlePostRevision, handlePostRevisionRestore, dbFirst } from './functions/_lib/api-core.js';
 import { onRequest as aiPing } from './functions/api/ai/ping.js';
 import { onRequest as aiSummary } from './functions/api/ai/summary.js';
 import { onRequest as aiAssist } from './functions/api/ai/assist.js';
 import { onRequest as aiComments } from './functions/api/ai/comments.js';
 import { handleMusic, handleMusicId, handleMusicUploadUrl } from './functions/_lib/music.js';
+import { handleBackups, handleBackupId, handleBackupRestore, createBackup } from './functions/_lib/backup.js';
+import { handleSubscribe, handleSubscribeConfirm, handleUnsubscribe, handleSubscribersAdmin, handleSubscriberId, processMailOutbox } from './functions/_lib/subscribe.js';
+import { handleOgUploadUrl } from './functions/_lib/og.js';
 import { handleMediaUploadUrl, deleteMediaObject } from './functions/_lib/media.js';
 
 export default {
@@ -37,12 +44,66 @@ export default {
     }
   },
 
+  async scheduled(event, env) {
+    try {
+      const now = event && event.scheduledTime ? event.scheduledTime : Date.now();
+      const result = await publishScheduledPosts(env, now);
+      if (result && result.published) {
+        console.log('[cron] scheduled posts published:', result.published, result.ids.join(','));
+      }
+      const mail = await processMailOutbox(env, 20);
+      if (mail && (mail.sent || mail.failed)) console.log('[cron] subscriber mail:', mail.sent, mail.failed);
+      if (event && event.cron === '0 19 * * *') {
+        const backup = await createBackup(env, 'auto');
+        console.log('[cron] daily backup created:', backup.id, backup.size);
+      }
+    } catch (e) {
+      console.error('[cron] scheduled publishing failed:', e && e.message, e && e.stack);
+    }
+  },
+
   async handle(request, env) {
     const url = new URL(request.url);
 
     // API 路由
+    if (url.pathname === '/api/popular') {
+      return handlePopular(request, env);
+    }
+    if (url.pathname === '/api/search') {
+      return handleSearch(request, env);
+    }
     if (url.pathname === '/api/posts') {
       return handlePosts(request, env);
+    }
+    if (url.pathname === '/api/subscribe') {
+      return handleSubscribe(request, env);
+    }
+    if (url.pathname === '/api/subscribe/confirm') {
+      return handleSubscribeConfirm(request, env);
+    }
+    if (url.pathname === '/api/subscribe/unsubscribe') {
+      return handleUnsubscribe(request, env);
+    }
+    if (url.pathname === '/api/admin/og-upload-url') {
+      return handleOgUploadUrl(request, env);
+    }
+    if (url.pathname === '/api/admin/subscribers') {
+      return handleSubscribersAdmin(request, env);
+    }
+    let subscriberMatch = url.pathname.match(/^\/api\/admin\/subscribers\/([^/]+)$/);
+    if (subscriberMatch) {
+      return handleSubscriberId(request, env, decodeURIComponent(subscriberMatch[1]));
+    }
+    if (url.pathname === '/api/admin/backups') {
+      return handleBackups(request, env);
+    }
+    let backupMatch = url.pathname.match(/^\/api\/admin\/backups\/([^/]+)\/restore$/);
+    if (backupMatch) {
+      return handleBackupRestore(request, env, decodeURIComponent(backupMatch[1]));
+    }
+    backupMatch = url.pathname.match(/^\/api\/admin\/backups\/([^/]+)$/);
+    if (backupMatch) {
+      return handleBackupId(request, env, decodeURIComponent(backupMatch[1]));
     }
     if (url.pathname === '/api/admin/setup') {
       return handleAdminSetup(request, env);
@@ -52,6 +113,9 @@ export default {
     }
     if (url.pathname === '/api/admin/logout') {
       return handleAdminLogout(request, env);
+    }
+    if (url.pathname === '/api/admin/post-analytics') {
+      return handlePostAnalytics(request, env);
     }
     if (url.pathname === '/api/admin/password') {
       return handleAdminPassword(request, env);
@@ -71,6 +135,10 @@ export default {
     if (url.pathname === '/api/stats/trend') {
       return handleStatsTrend(request, env);
     }
+    let cl = url.pathname.match(/^\/api\/comments\/([^/]+)\/like$/);
+    if (cl) {
+      return handleCommentLike(request, env, decodeURIComponent(cl[1]));
+    }
     let cm = url.pathname.match(/^\/api\/comments\/([^/]+)$/);
     if (cm) {
       if (request.method === 'DELETE') return handleCommentDeleteGlobal(request, env, decodeURIComponent(cm[1]));
@@ -81,8 +149,8 @@ export default {
       const mid = decodeURIComponent(mm[1]);
       // 删除媒体：先删 R2 对象（若 url 是本站 media/ 前缀），再删 D1 元数据
       if (request.method === 'DELETE') {
-        const row = env && env.DB ? await dbFirst(env.DB, 'SELECT url FROM media WHERE id = ?', mid).catch(() => null) : null;
-        if (row && row.url) { try { await deleteMediaObject(env, row.url); } catch (e) { /* R2 删除失败不阻塞 */ } }
+        const row = env && env.DB ? await dbFirst(env.DB, 'SELECT url, thumb_url FROM media WHERE id = ?', mid).catch(() => null) : null;
+        if (row && row.url) { try { await deleteMediaObject(env, row.url, row.thumb_url || ''); } catch (e) { /* R2 删除失败不阻塞 */ } }
       }
       return handleMediaId(request, env, mid);
     }
@@ -98,7 +166,19 @@ export default {
     if (url.pathname === '/feed.xml') {
       return handleFeed(request, env);
     }
-    let match = url.pathname.match(/^\/api\/posts\/([^/]+)\/comments\/([^/]+)$/);
+    let match = url.pathname.match(/^\/api\/posts\/([^/]+)\/revisions\/([^/]+)\/restore$/);
+    if (match) {
+      return handlePostRevisionRestore(request, env, decodeURIComponent(match[1]), decodeURIComponent(match[2]));
+    }
+    match = url.pathname.match(/^\/api\/posts\/([^/]+)\/revisions\/([^/]+)$/);
+    if (match) {
+      return handlePostRevision(request, env, decodeURIComponent(match[1]), decodeURIComponent(match[2]));
+    }
+    match = url.pathname.match(/^\/api\/posts\/([^/]+)\/revisions$/);
+    if (match) {
+      return handlePostRevisions(request, env, decodeURIComponent(match[1]));
+    }
+    match = url.pathname.match(/^\/api\/posts\/([^/]+)\/comments\/([^/]+)$/);
     if (match) {
       return handleCommentId(request, env, decodeURIComponent(match[1]), decodeURIComponent(match[2]));
     }
@@ -109,6 +189,10 @@ export default {
     match = url.pathname.match(/^\/api\/posts\/([^/]+)\/stats$/);
     if (match) {
       return handleStats(request, env, decodeURIComponent(match[1]));
+    }
+    match = url.pathname.match(/^\/api\/posts\/([^/]+)\/relations$/);
+    if (match) {
+      return handlePostRelations(request, env, decodeURIComponent(match[1]));
     }
     match = url.pathname.match(/^\/api\/posts\/([^/]+)$/);
     if (match) {
@@ -174,8 +258,14 @@ export default {
         // 版本化资源（style.css?v=…、app.js?v=…）与字体/图标等不可变资源，可放心一年强缓存；
         // 其余扩展名静态文件保持 1 小时 + SWR（部署后仍能快速生效）。
         const versioned = url.search && url.search.indexOf('v=') === 1;
-        const immutablePath = /^\/fonts\/|^\/flags\/|^\/libs\/smoji\//.test(url.pathname);
-        if (hasExt && request.method === 'GET') {
+        const immutablePath = /^\/fonts\/|^\/flags\/|^\/libs\/smoji\/|^\/icons\//.test(url.pathname);
+        if (url.pathname === '/sw.js') {
+          headers.set('Cache-Control', 'no-cache');
+          headers.set('Service-Worker-Allowed', '/');
+        } else if (url.pathname === '/manifest.webmanifest') {
+          headers.set('Content-Type', 'application/manifest+json; charset=utf-8');
+          headers.set('Cache-Control', 'public, max-age=3600');
+        } else if (hasExt && request.method === 'GET') {
           headers.set('Cache-Control', versioned || immutablePath
             ? 'public, max-age=31536000, immutable'
             : 'public, max-age=3600, stale-while-revalidate=86400');

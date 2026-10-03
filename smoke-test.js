@@ -398,6 +398,42 @@ tests.push(['parseMdFile：frontmatter 与无 frontmatter', async () => {
   assert.strictEqual(r2.title, '我的笔记');
 }]);
 
+tests.push(['admin 导入导出：Markdown 往返 / JSON 备份 / ZIP 打包', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  const tr = b.win.QingyuAdmin && b.win.QingyuAdmin._transfer;
+  assert.ok(tr && tr.postToMarkdown && tr.parseMarkdown && tr.zip, '导入导出工具已暴露');
+  const ed = b.win.QingyuAdmin && b.win.QingyuAdmin._editor;
+  assert.ok(ed && ed.toDateTimeLocal && ed.normalizeEditorDate, '编辑器日期工具已暴露');
+  const off = b.win.QingyuAdmin && b.win.QingyuAdmin._offline;
+  assert.ok(off && off.queue && off.read && off.flush, '离线写作队列工具已暴露');
+  off.queue({ id: 'offline-local', title: '离线文章', date: '2026-01-01', content: '断网内容', tags: [] }, true);
+  assert.ok(off.read().some((item) => item.post.id === 'offline-local'), '离线文章进入待同步队列');
+  assert.strictEqual(ed.toDateTimeLocal('2026-10-01'), '2026-10-01T00:00', '纯日期补 00:00');
+  assert.strictEqual(ed.toDateTimeLocal('2026-10-01 09:05'), '2026-10-01T09:05', '分钟时间转换正确');
+  assert.strictEqual(ed.normalizeEditorDate('2026-10-01T09:05'), '2026-10-01 09:05', '保存时转为分钟精度');
+  const source = {
+    id: 'round-trip', title: '往返测试: 标题', date: '2026-09-30', tags: ['技术', '写作'],
+    excerpt: '摘要', cover: 'https://example.com/cover.jpg', category: '随笔',
+    status: 'draft', pinned: true, content: '## 正文\n\n**Markdown** 内容'
+  };
+  const md = tr.postToMarkdown(source);
+  const parsed = tr.parseMarkdown(md, 'round-trip.md');
+  assert.strictEqual(parsed.title, source.title, 'Markdown 标题保留');
+  assert.deepStrictEqual(parsed.tags, source.tags, 'Markdown 标签保留');
+  assert.strictEqual(parsed.status, 'draft', 'Markdown 草稿状态保留');
+  assert.strictEqual(parsed.pinned, true, 'Markdown 置顶状态保留');
+  assert.strictEqual(parsed.content, source.content, 'Markdown 正文保留');
+  const backup = JSON.parse(tr.backup([source]));
+  assert.strictEqual(backup.posts[0].id, source.id, 'JSON 备份保留文章');
+  b.ctx.Blob = Blob;
+  const zip = tr.zip([source]);
+  const bytes = new Uint8Array(await zip.arrayBuffer());
+  assert.deepStrictEqual(Array.from(bytes.slice(0, 4)), [0x50, 0x4B, 0x03, 0x04], 'ZIP 文件头正确');
+  const zipText = new TextDecoder().decode(bytes);
+  assert.ok(zipText.includes('.md') && zipText.includes('posts.json'), 'ZIP 含 Markdown 与 JSON 备份');
+}]);
+
 tests.push(['buildPostsJs：合并草稿并归一化 tags', async () => {
   const { ctx, win } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
   ctx.saveDraftToStore('__new', { id: 'n1', title: '新文章', date: '2025-03-01', tags: '技术, 随笔', content: '内容', pinned: true });
@@ -425,40 +461,177 @@ tests.push(['stripMd 生成纯文本摘要', async () => {
 function makeD1() {
   let seq = 0;   // 模拟 SQLite rowid（单调递增，保证插入顺序稳定）
   const t = {
-    posts: new Map(), comments: new Map(), stats: new Map(), media: new Map(),
+    posts: new Map(), post_revisions: new Map(), backups: new Map(), subscribers: new Map(), mail_outbox: new Map(), comments: new Map(), stats: new Map(), media: new Map(),
     admin_auth: new Map(), admin_sessions: new Map(), admin_fails: new Map()
   };
-  const POST_COLS = ['id', 'title', 'date', 'excerpt', 'content', 'cover', 'pinned', 'protected', 'enc', 'tags'];
+  const POST_COLS = ['id', 'title', 'date', 'excerpt', 'content', 'cover', 'og_image', 'pinned', 'protected', 'enc', 'tags', 'category', 'series', 'series_order', 'status', 'publish_at'];
 
   function exec(sql, params) {
     const s = sql.replace(/\s+/g, ' ').trim();
     /* posts */
     if (s === 'SELECT * FROM posts') return [...t.posts.values()];
+    const postColumns = /^SELECT ([a-z_]+(?:,[a-z_]+)*) FROM posts$/.exec(s);
+    if (postColumns) {
+      const cols = postColumns[1].split(',');
+      return [...t.posts.values()].map((row) => { const o = {}; cols.forEach((c) => { o[c] = row[c] === undefined ? null : row[c]; }); return o; });
+    }
+    if (s === "SELECT * FROM posts WHERE status = 'scheduled' AND publish_at IS NOT NULL AND publish_at <= ?") {
+      return [...t.posts.values()].filter((r) => r.status === 'scheduled' && Number(r.publish_at) <= Number(params[0])).slice();
+    }
     if (s === 'SELECT 1 FROM posts WHERE id = ?') return t.posts.has(params[0]) ? { '1': 1 } : null;
     if (s === 'SELECT * FROM posts WHERE id = ?') return t.posts.get(params[0]) || null;
+    if (s === 'SELECT title FROM posts WHERE id = ?') { const row = t.posts.get(params[0]); return row ? { title: row.title } : null; }
+    if (s === 'SELECT * FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC, id DESC LIMIT 1') {
+      return [...t.post_revisions.values()].filter((r) => r.post_id === params[0]).sort((a, b) => b.created_at - a.created_at || b.id - a.id)[0] || null;
+    }
+    if (s === 'SELECT id FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC, id DESC') {
+      return [...t.post_revisions.values()].filter((r) => r.post_id === params[0]).sort((a, b) => b.created_at - a.created_at || b.id - a.id).map((r) => ({ id: r.id }));
+    }
+    if (s === 'SELECT id,post_id,title,date,excerpt,cover,og_image,pinned,protected,tags,category,series,series_order,status,publish_at,reason,created_at FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC, id DESC') {
+      return [...t.post_revisions.values()].filter((r) => r.post_id === params[0]).sort((a, b) => b.created_at - a.created_at || b.id - a.id);
+    }
+    if (s === 'SELECT * FROM post_revisions WHERE post_id = ? AND id = ?') {
+      return [...t.post_revisions.values()].find((r) => r.post_id === params[0] && r.id === Number(params[1])) || null;
+    }
+    if (/^INSERT INTO post_revisions/.test(s)) {
+      const id = ++seq;
+      const [post_id,title,date,excerpt,content,cover,og_image,pinned,protectedFlag,enc,tags,category,series,series_order,status,publish_at,reason,created_at] = params;
+      t.post_revisions.set(id, { id, post_id, title, date, excerpt, content, cover, og_image, pinned, protected: protectedFlag, enc, tags, category, series, series_order, status, publish_at, reason, created_at });
+      return { success: true };
+    }
+    if (s === 'DELETE FROM post_revisions WHERE id = ?') { t.post_revisions.delete(Number(params[0])); return { success: true }; }
     if (/^INSERT( OR REPLACE)? INTO posts/.test(s)) {
       const row = {}; POST_COLS.forEach((c, i) => { row[c] = params[i]; });
       t.posts.set(row.id, row); return { success: true };
     }
+    if (s === "UPDATE posts SET status = 'published', publish_at = NULL WHERE id = ? AND status = 'scheduled'") {
+      const row = t.posts.get(params[0]);
+      if (row && row.status === 'scheduled') { row.status = 'published'; row.publish_at = null; }
+      return { success: true };
+    }
     if (s === 'DELETE FROM posts WHERE id = ?') { t.posts.delete(params[0]); return { success: true }; }
+    /* subscribers / mail outbox */
+    if (s === 'SELECT * FROM subscribers WHERE email = ?') {
+      return [...t.subscribers.values()].find((r) => r.email === params[0]) || null;
+    }
+    if (s === 'SELECT * FROM subscribers WHERE token = ?') {
+      return [...t.subscribers.values()].find((r) => r.token === params[0]) || null;
+    }
+    if (s === "SELECT email FROM subscribers WHERE status = 'active'") {
+      return [...t.subscribers.values()].filter((r) => r.status === 'active').map((r) => ({ email: r.email }));
+    }
+    if (s === 'SELECT * FROM subscribers ORDER BY created_at DESC') {
+      return [...t.subscribers.values()].sort((a, b) => b.created_at - a.created_at);
+    }
+    if (/^INSERT INTO subscribers/.test(s)) {
+      const [id,email,status,token,locale,created_at,confirmed_at,unsubscribed_at,last_notified_at] = params;
+      const old = [...t.subscribers.values()].find((r) => r.email === email);
+      t.subscribers.set(old ? old.id : id, { id: old ? old.id : id, email, status, token, locale, created_at, confirmed_at, unsubscribed_at, last_notified_at });
+      return { success: true };
+    }
+    if (s === "UPDATE subscribers SET status = 'active', confirmed_at = ?, unsubscribed_at = NULL WHERE id = ?") {
+      const row = t.subscribers.get(params[1]); if (row) { row.status = 'active'; row.confirmed_at = params[0]; row.unsubscribed_at = null; } return { success: true };
+    }
+    if (s === "UPDATE subscribers SET status = 'unsubscribed', unsubscribed_at = ? WHERE id = ?") {
+      const row = t.subscribers.get(params[1]); if (row) { row.status = 'unsubscribed'; row.unsubscribed_at = params[0]; } return { success: true };
+    }
+    if (s === 'UPDATE subscribers SET last_notified_at = ? WHERE email = ?') {
+      const row = [...t.subscribers.values()].find((r) => r.email === params[1]); if (row) row.last_notified_at = params[0]; return { success: true };
+    }
+    if (s === 'DELETE FROM subscribers WHERE id = ?') { t.subscribers.delete(params[0]); return { success: true }; }
+    if (/^INSERT(?: OR IGNORE)? INTO mail_outbox/.test(s)) {
+      const [post_id,to_email,status,attempts,error,created_at,kind,payload] = params;
+      const key = post_id + '|' + to_email;
+      if (!t.mail_outbox.has(key)) t.mail_outbox.set(key, { id: ++seq, post_id, to_email, status, attempts, error, created_at, kind: kind || 'post', payload: payload || '', sent_at: null });
+      return { success: true };
+    }
+    if (/^SELECT \* FROM mail_outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT \d+$/.test(s)) {
+      const limit = Number(s.split('LIMIT ')[1]) || 20;
+      return [...t.mail_outbox.values()].filter((r) => r.status === 'pending').sort((a, b) => a.created_at - b.created_at).slice(0, limit);
+    }
+    if (s === "UPDATE mail_outbox SET status = 'skipped', error = 'article or subscriber unavailable', sent_at = ? WHERE id = ?") {
+      const row = t.mail_outbox.get([...t.mail_outbox.keys()].find((k) => t.mail_outbox.get(k).id === params[1])); if (row) { row.status = 'skipped'; row.error = 'article or subscriber unavailable'; row.sent_at = params[0]; } return { success: true };
+    }
+    if (s === "UPDATE mail_outbox SET status = 'sent', sent_at = ?, attempts = attempts + 1, error = '' WHERE id = ?") {
+      const row = [...t.mail_outbox.values()].find((r) => r.id === params[1]); if (row) { row.status = 'sent'; row.sent_at = params[0]; row.attempts++; row.error = ''; } return { success: true };
+    }
+    if (s === 'UPDATE mail_outbox SET attempts = attempts + 1, error = ? WHERE id = ?') {
+      const row = [...t.mail_outbox.values()].find((r) => r.id === params[1]); if (row) { row.attempts++; row.error = params[0]; } return { success: true };
+    }
+    /* backups */
+    if (s === 'SELECT id,object_key FROM backups ORDER BY created_at DESC, id DESC') {
+      return [...t.backups.values()].sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? 1 : -1));
+    }
+    if (s === 'SELECT * FROM backups ORDER BY created_at DESC, id DESC') {
+      return [...t.backups.values()].sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? 1 : -1));
+    }
+    if (s === 'SELECT * FROM backups WHERE id = ?') return t.backups.get(params[0]) || null;
+    if (/^INSERT INTO backups/.test(s)) {
+      const [id, object_key, size, reason, created_at, counts] = params;
+      t.backups.set(id, { id, object_key, size, reason, created_at, counts }); return { success: true };
+    }
+    if (s === 'DELETE FROM backups WHERE id = ?') { t.backups.delete(params[0]); return { success: true }; }
     /* comments */
-    if (s === 'SELECT * FROM comments WHERE post_id = ? ORDER BY rowid ASC'
-      || s === "SELECT * FROM comments WHERE post_id = ? AND (status = 'approved' OR status IS NULL) ORDER BY rowid ASC") {
-      return [...t.comments.values()].filter((r) => r.post_id === params[0])
-        .filter((r) => !s.includes('status') || (r.status === 'approved' || r.status == null))
-        .sort((a, b) => (a.__rowid || 0) - (b.__rowid || 0));
+    if (/^SELECT \*(, rowid AS rid)? FROM comments WHERE post_id = \?/.test(s) && /ORDER BY (rowid|COALESCE)/.test(s)) {
+      let rows = [...t.comments.values()].filter((r) => r.post_id === params[0]).map((r) => Object.assign({ rid: r.__rowid }, r));
+      if (s.includes('status')) rows = rows.filter((r) => r.status === 'approved' || r.status == null);
+      if (s.includes('COALESCE(pinned')) {
+        rows.sort((a, b) => (Number(b.pinned) || 0) - (Number(a.pinned) || 0)
+          || (Number(b.featured) || 0) - (Number(a.featured) || 0)
+          || (Number(b.likes) || 0) - (Number(a.likes) || 0)
+          || (a.__rowid || 0) - (b.__rowid || 0));
+      } else {
+        rows.sort((a, b) => (a.__rowid || 0) - (b.__rowid || 0));
+      }
+      return rows;
+    }
+    // 后台评论列表：comments LEFT JOIN posts（含文章标题）
+    if (/^SELECT c\.\*, p\.title AS post_title FROM comments c/.test(s)) {
+      let rows = [...t.comments.values()];
+      if (s.includes('WHERE c.status = ?')) rows = rows.filter((r) => r.status === params[0]);
+      rows.sort((a, b) => (b.__rowid || 0) - (a.__rowid || 0));
+      return rows.map((r) => Object.assign({}, r, { post_title: (t.posts.get(r.post_id) || {}).title || null }));
     }
     if (s === 'SELECT COUNT(*) AS c FROM comments WHERE post_id = ?') {
       let c = 0; for (const r of t.comments.values()) if (r.post_id === params[0]) c++;
       return { c };
     }
     if (/^INSERT INTO comments/.test(s)) {
-      const [id, post_id, author, content, date] = params;
-      t.comments.set(id, { id, post_id, author, content, date, __rowid: ++seq }); return { success: true };
+      const [id, post_id, author, content, date, status, parent_id] = params;
+      t.comments.set(id, { id, post_id, author, content, date, status, parent_id, likes: 0, featured: 0, pinned: 0, __rowid: ++seq });
+      return { success: true };
     }
     if (s === 'SELECT 1 FROM comments WHERE post_id = ? AND id = ?') {
       const r = t.comments.get(params[1]);
       return (r && r.post_id === params[0]) ? { '1': 1 } : null;
+    }
+    if (s === 'SELECT post_id FROM comments WHERE id = ?') {
+      const r = t.comments.get(params[0]);
+      return r ? { post_id: r.post_id } : null;
+    }
+    if (s === 'SELECT likes FROM comments WHERE id = ?') {
+      const r = t.comments.get(params[0]);
+      return r ? { likes: Number(r.likes) || 0 } : null;
+    }
+    if (s === 'SELECT parent_id FROM comments WHERE post_id = ? AND id = ?') {
+      const r = t.comments.get(params[1]);
+      return (r && r.post_id === params[0]) ? { parent_id: r.parent_id === undefined ? null : r.parent_id } : null;
+    }
+    if (s === 'UPDATE comments SET likes = MIN(COALESCE(likes,0) + 1, 999999) WHERE id = ?') {
+      const r = t.comments.get(params[0]);
+      if (r) r.likes = Math.min((Number(r.likes) || 0) + 1, 999999);
+      return { success: true };
+    }
+    // 后台修改评论字段：UPDATE comments SET col = ?[, col2 = ?] WHERE id = ?
+    if (/^UPDATE comments SET [a-z_]+ = \?(, [a-z_]+ = \?)* WHERE id = \?$/.test(s)) {
+      const cols = s.slice('UPDATE comments SET '.length, s.indexOf(' WHERE id = ?')).split(',').map((x) => x.trim().split('=')[0].trim());
+      const id = params[params.length - 1];
+      const r = t.comments.get(id);
+      if (r) cols.forEach((col, i) => { r[col] = params[i]; });
+      return { success: true };
+    }
+    if (s === 'DELETE FROM comments WHERE id = ?') {
+      t.comments.delete(params[0]); return { success: true };
     }
     // 重复发送查重（api-core handleComments）：同分区 + 同昵称 + 同内容
     if (/^SELECT id FROM comments WHERE post_id = \? AND author = \? AND content = \? LIMIT 1$/.test(s)) {
@@ -496,6 +669,9 @@ function makeD1() {
       if (!mLike && !mView) { const [, likes, views] = params; row.likes = likes; row.views = views; }
       t.stats.set(post_id, row); return { success: true };
     }
+    if (s === 'SELECT * FROM stats') return [...t.stats.values()];
+    if (s === 'SELECT post_id,status,date FROM comments') return [...t.comments.values()].map((r) => ({ post_id: r.post_id, status: r.status, date: r.date }));
+    if (s === 'SELECT * FROM stats_daily') return [];
     /* stats_daily (聚合表，测试仅需不报错) */
     if (/^INSERT INTO stats_daily/.test(s)) { return { success: true }; }
     /* admin_auth */
@@ -524,8 +700,8 @@ function makeD1() {
     }
     /* media */
     if (/^INSERT INTO media/.test(s)) {
-      const [id, name, url, type, size, created_at] = params;
-      const row = { id, name, url, type, size, created_at, __rowid: ++seq };
+      const [id, name, url, thumb_url, type, size, created_at] = params;
+      const row = { id, name, url, thumb_url, type, size, created_at, __rowid: ++seq };
       t.media.set(id, row); return { success: true };
     }
 
@@ -595,10 +771,262 @@ tests.push(['API：POST / GET / 重复 id 409 / 缺字段 400', async () => {
   r = await post({ id: 'a3', content: '没标题' });
   assert.strictEqual(r.status, 400, '缺 title 返回 400');
 
+  r = await post({ id: 'draft1', title: '草稿', date: '2025-01-03', content: '草稿正文', status: 'draft' });
+  assert.strictEqual(r.status, 201);
   const list = await (await core.handlePosts(new Request('http://t/api/posts'), env)).json();
-  assert.strictEqual(list.posts.length, 2);
+  assert.strictEqual(list.posts.length, 2, '公开列表不返回草稿');
   assert.strictEqual(list.posts[0].id, 'a1', '按日期倒序');
   assert.deepStrictEqual(list.posts[0].tags, ['技术', '随笔'], 'tags 归一为数组');
+
+  let adminList = await core.handlePosts(new Request('http://t/api/posts?all=1'), env);
+  assert.strictEqual(adminList.status, 401, '后台 all=1 未登录拒绝');
+  adminList = await core.handlePosts(new Request('http://t/api/posts?all=1', { headers: { Authorization: 'Bearer ' + token } }), env);
+  assert.strictEqual(adminList.status, 200);
+  assert.strictEqual((await adminList.json()).posts.length, 3, '后台 all=1 包含草稿');
+  let fullRes = await core.handlePosts(new Request('http://t/api/posts?full=1'), env);
+  assert.strictEqual(fullRes.status, 401, '后台 full=1 未登录拒绝');
+  fullRes = await core.handlePosts(new Request('http://t/api/posts?full=1', { headers: { Authorization: 'Bearer ' + token } }), env);
+  const full = await fullRes.json();
+  assert.strictEqual(full.posts.find((p) => p.id === 'a1').content, '**内容**', 'full=1 返回正文');
+}]);
+
+tests.push(['API：定时发布到期后自动发布', async () => {
+  const { env, token, core } = await authEnv();
+  const now = Date.now();
+  const authJson = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  const create = (post) => core.handlePosts(new Request('http://t/api/posts', {
+    method: 'POST', headers: authJson, body: JSON.stringify(post)
+  }), env);
+  let r = await create({ id: 'sched-due', title: '已到期', date: '2026-10-01', content: 'A', status: 'scheduled', publishAt: now - 1000 });
+  assert.strictEqual(r.status, 201);
+  r = await create({ id: 'sched-future', title: '未到期', date: '2026-10-02', content: 'B', status: 'scheduled', publishAt: now + 3600000 });
+  assert.strictEqual(r.status, 201);
+
+  let publicList = await (await core.handlePosts(new Request('http://t/api/posts'), env)).json();
+  assert.strictEqual(publicList.posts.length, 0, '公开列表不返回定时文章');
+  let hidden = await core.handlePostId(new Request('http://t/api/posts/sched-due'), env, 'sched-due');
+  assert.strictEqual(hidden.status, 404, '未登录不可读取定时文章');
+
+  const published = await core.publishScheduledPosts(env, now);
+  assert.strictEqual(published.published, 1, '只发布已到期文章');
+  assert.deepStrictEqual(published.ids, ['sched-due']);
+  publicList = await (await core.handlePosts(new Request('http://t/api/posts'), env)).json();
+  assert.deepStrictEqual(publicList.posts.map((p) => p.id), ['sched-due'], '到期文章进入公开列表');
+  const adminList = await (await core.handlePosts(new Request('http://t/api/posts?all=1', { headers: authJson }), env)).json();
+  const future = adminList.posts.find((p) => p.id === 'sched-future');
+  assert.strictEqual(future.status, 'scheduled', '未到期文章保持定时状态');
+  assert.ok(future.publishAt > now, '未到期时间保留');
+}]);
+
+tests.push(['API：文章版本历史与恢复', async () => {
+  const { env, token, core } = await authEnv();
+  const authHeaders = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  let r = await core.handlePosts(new Request('http://t/api/posts', {
+    method: 'POST', headers: authHeaders,
+    body: JSON.stringify({ id: 'rev1', title: '第一版', date: '2026-10-01', content: '旧内容', ogImage: 'https://example.com/old-og.png', series: '测试系列', seriesOrder: 1 })
+  }), env);
+  assert.strictEqual(r.status, 201);
+  r = await core.handlePostId(new Request('http://t/api/posts/rev1', {
+    method: 'PUT', headers: authHeaders,
+    body: JSON.stringify({ title: '第二版', date: '2026-10-01', content: '新内容', ogImage: 'https://example.com/new-og.png' })
+  }), env, 'rev1');
+  assert.strictEqual(r.status, 200);
+  const listRes = await core.handlePostRevisions(new Request('http://t/api/posts/rev1/revisions', { headers: authHeaders }), env, 'rev1');
+  const list = await listRes.json();
+  assert.ok(list.revisions.length >= 2, '保存后生成历史版本');
+  const old = list.revisions[list.revisions.length - 1];
+  const oneRes = await core.handlePostRevision(new Request('http://t/api/posts/rev1/revisions/' + old.id, { headers: authHeaders }), env, 'rev1', old.id);
+  const one = await oneRes.json();
+  assert.strictEqual(one.revision.content, '旧内容', '可读取完整历史正文');
+  const restoreRes = await core.handlePostRevisionRestore(new Request('http://t/api/posts/rev1/revisions/' + old.id + '/restore', { method: 'POST', headers: authHeaders }), env, 'rev1', old.id);
+  assert.strictEqual(restoreRes.status, 200, '可恢复历史版本');
+  const current = await (await core.handlePostId(new Request('http://t/api/posts/rev1', { headers: authHeaders }), env, 'rev1')).json();
+  assert.strictEqual(current.post.title, '第一版');
+  assert.strictEqual(current.post.content, '旧内容');
+  assert.strictEqual(current.post.series, '测试系列');
+  assert.strictEqual(current.post.seriesOrder, 1);
+  assert.strictEqual(current.post.ogImage, 'https://example.com/old-og.png', '恢复版本时保留分享图');
+}]);
+
+tests.push(['API：文章双向链接与相关文章推荐', async () => {
+  const { env, token, core } = await authEnv();
+  const authHeaders = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  const create = (body) => core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers: authHeaders, body: JSON.stringify(body) }), env);
+  await create({ id: 'rel-target', title: '目标文章', date: '2026-04-03', content: '目标正文', tags: ['共享标签'], series: '示例系列' });
+  await create({ id: 'rel-related', title: '相关文章', date: '2026-04-02', content: '共同标签文章', tags: ['共享标签'], series: '示例系列' });
+  await create({ id: 'rel-backlink', title: '引用文章', date: '2026-04-04', content: '参见 [[目标文章]] 的详细说明', tags: ['其他'] });
+  await create({ id: 'rel-markdown', title: 'Markdown 引用', date: '2026-04-01', content: '阅读 [目标文章](/posts/rel-target/) 继续了解', tags: ['其他'] });
+  const relationsLib = await import('./functions/_lib/relations.js');
+  const res = await relationsLib.handlePostRelations(new Request('http://t/api/posts/rel-target/relations'), env, 'rel-target');
+  assert.strictEqual(res.status, 200, '关系接口可访问');
+  const data = await res.json();
+  assert.ok(data.related.some((p) => p.id === 'rel-related'), '共同标签/系列进入相关文章');
+  assert.ok(data.backlinks.some((p) => p.id === 'rel-backlink'), 'Wiki 链接生成反向链接');
+  assert.ok(data.backlinks.some((p) => p.id === 'rel-markdown'), 'Markdown 站内链接生成反向链接');
+}]);
+
+
+tests.push(['API：热门文章综合排行', async () => {
+  const { env, token, core } = await authEnv();
+  const headers = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  const create = (body) => core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers, body: JSON.stringify(body) }), env);
+  await create({ id: 'pop-a', title: '热门第一', date: '2026-05-01', content: 'A' });
+  await create({ id: 'pop-b', title: '热门第二', date: '2026-05-02', content: 'B' });
+  env._d1.stats.set('pop-a', { post_id: 'pop-a', views: 10, likes: 5 });
+  env._d1.stats.set('pop-b', { post_id: 'pop-b', views: 20, likes: 1 });
+  env._d1.comments.set('pop-c1', { id: 'pop-c1', post_id: 'pop-a', status: 'approved', date: '2026-05-03' });
+  env._d1.comments.set('pop-c2', { id: 'pop-c2', post_id: 'pop-a', status: 'approved', date: '2026-05-03' });
+  const popularLib = await import('./functions/_lib/popular.js');
+  const r = await popularLib.handlePopular(new Request('http://t/api/popular?range=all'), env);
+  assert.strictEqual(r.status, 200);
+  const data = await r.json();
+  assert.strictEqual(data.items[0].id, 'pop-a', '综合得分最高排第一');
+  assert.strictEqual(data.items[0].score, 35, '浏览/点赞/评论按权重计分');
+}]);
+
+tests.push(['API：后台文章数据分析与权限', async () => {
+  const { env, token, core } = await authEnv();
+  const headers = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  const create = (body) => core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers, body: JSON.stringify(body) }), env);
+  await create({ id: 'ana-a', title: '数据第一', date: '2026-06-01', content: 'A', tags: ['数据'] });
+  await create({ id: 'ana-b', title: '数据草稿', date: '2026-06-02', content: 'B', status: 'draft' });
+  env._d1.stats.set('ana-a', { post_id: 'ana-a', views: 9, likes: 2 });
+  env._d1.comments.set('ana-c1', { id: 'ana-c1', post_id: 'ana-a', author: 'x', content: 'c', date: '2026-06-03', status: 'approved' });
+  const analytics = await import('./functions/_lib/analytics.js');
+  const noAuth = await analytics.handlePostAnalytics(new Request('http://t/api/admin/post-analytics'), env);
+  assert.strictEqual(noAuth.status, 401, '未登录不可读文章数据');
+  const res = await analytics.handlePostAnalytics(new Request('http://t/api/admin/post-analytics?range=all', { headers }), env);
+  const data = await res.json();
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(data.items.length, 2, '后台分析包含草稿');
+  assert.strictEqual(data.items.find((p) => p.id === 'ana-a').score, 20, '综合得分为浏览 + 点赞×3 + 评论×5');
+  assert.strictEqual(data.summary.posts, 2, '汇总文章数正确');
+  assert.strictEqual(data.trendDays, 30, '默认返回近 30 天趋势');
+  assert.strictEqual(data.items[0].trend.length, 30, '每篇文章都带趋势数据');
+}]);
+
+tests.push(['备份：创建 R2 备份并登记列表', async () => {
+  const { env, token, core } = await authEnv();
+  env.R2_ACCESS_KEY_ID = 'test-key';
+  env.R2_SECRET_ACCESS_KEY = 'test-secret';
+  env.R2_ENDPOINT = 'https://r2.example';
+  env.R2_BACKUP_BUCKET = 'blog-backups';
+  const authJson = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  await core.handlePosts(new Request('http://t/api/posts', {
+    method: 'POST', headers: authJson,
+    body: JSON.stringify({ id: 'backup-post', title: '备份文章', content: '内容' })
+  }), env);
+  const backup = await import('./functions/_lib/backup.js');
+  const originalFetch = global.fetch;
+  let uploadedBody = '';
+  global.fetch = async function (url, opts) {
+    if (opts && String(opts.method || '').toUpperCase() === 'PUT') {
+      uploadedBody = String(opts.body || '');
+      return new Response('', { status: 200 });
+    }
+    return new Response(uploadedBody, { status: 200 });
+  };
+  try {
+    const created = await backup.createBackup(env, 'manual');
+    assert.ok(created.id && created.size > 0, '创建备份元数据');
+    assert.ok(uploadedBody.includes('backup-post') && uploadedBody.includes('备份文章'), '备份包含文章数据');
+    const r = await backup.handleBackups(new Request('http://t/api/admin/backups', { headers: authJson }), env);
+    const data = await r.json();
+    assert.strictEqual(data.configured, true);
+    assert.strictEqual(data.backups.length, 1);
+    assert.strictEqual(data.backups[0].reason, 'manual');
+    assert.strictEqual(data.backups[0].counts.posts, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}]);
+
+tests.push(['订阅：确认邮箱并发送新文章通知', async () => {
+  const { env, token, core } = await authEnv();
+  env.RESEND_API_KEY = 're_test';
+  env.BLOG_MAIL_FROM = 'blog@example.com';
+  env.SITE_URL = 'https://blog.example';
+  const subscribe = await import('./functions/_lib/subscribe.js');
+  const originalFetch = global.fetch;
+  const emails = [];
+  global.fetch = async function (url, opts) {
+    if (String(url).indexOf('api.resend.com') >= 0) {
+      emails.push(JSON.parse(opts.body));
+      return new Response(JSON.stringify({ id: 'mail-' + emails.length }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return originalFetch(url, opts);
+  };
+  try {
+    let r = await subscribe.handleSubscribe(new Request('http://t/api/subscribe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'reader@example.com', locale: 'zh-CN' })
+    }), env);
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(emails.length, 1, '发送确认邮件');
+    const sub = [...env._d1.subscribers.values()][0];
+    assert.ok(sub && sub.token, '生成订阅 token');
+    r = await subscribe.handleSubscribeConfirm(new Request('http://t/api/subscribe/confirm?token=' + sub.token), env);
+    assert.strictEqual(r.status, 302);
+    assert.strictEqual((await env.DB.prepare('SELECT * FROM subscribers WHERE email = ?').bind('reader@example.com').first()).status, 'active');
+
+    await core.handlePosts(new Request('http://t/api/posts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({ id: 'newsletter-post', title: '订阅通知文章', content: '正文', status: 'published' })
+    }), env);
+    assert.strictEqual(env._d1.mail_outbox.size, 1, '发布后进入发件箱');
+    const result = await subscribe.processMailOutbox(env, 20);
+    assert.strictEqual(result.sent, 1, '异步发送通知邮件');
+    assert.ok(emails[1] && emails[1].to[0] === 'reader@example.com' && emails[1].subject.includes('订阅通知文章'), '通知内容正确');
+  } finally {
+    global.fetch = originalFetch;
+  }
+}]);
+
+tests.push(['邮件：新评论通知进入发件箱并发送给站长', async () => {
+  const { env, token, core } = await authEnv();
+  env.RESEND_API_KEY = 're_test';
+  env.BLOG_MAIL_FROM = 'blog@example.com';
+  env.SITE_URL = 'https://blog.example';
+  env.BLOG_ADMIN_EMAIL = 'owner@example.com';
+  const subscribe = await import('./functions/_lib/subscribe.js');
+  const authHeaders = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  const created = await core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers: authHeaders, body: JSON.stringify({ id: 'notify-post', title: '评论通知文章', content: '正文' }) }), env);
+  assert.strictEqual(created.status, 201);
+  const posted = await core.handleComments(new Request('http://t/api/posts/notify-post/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ author: '读者', content: '这是一条测试评论' }) }), env, 'notify-post');
+  assert.strictEqual(posted.status, 201);
+  const row = [...env._d1.mail_outbox.values()][0];
+  assert.ok(row && row.kind === 'comment' && row.to_email === 'owner@example.com', '新评论进入站长通知发件箱');
+  const originalFetch = global.fetch;
+  const emails = [];
+  global.fetch = async function (url, opts) { emails.push(JSON.parse(opts.body)); return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }); };
+  try {
+    const result = await subscribe.processMailOutbox(env, 20);
+    assert.strictEqual(result.sent, 1, '评论通知异步发送成功');
+    assert.ok(emails[0].subject.includes('评论通知文章') && emails[0].html.includes('这是一条测试评论'), '邮件正文包含文章和评论内容');
+  } finally { global.fetch = originalFetch; }
+}]);
+tests.push(['API：OG 分享图上传签名与文章字段', async () => {
+  const { env, token, core } = await authEnv();
+  env.R2_ACCESS_KEY_ID = 'test-key';
+  env.R2_SECRET_ACCESS_KEY = 'test-secret';
+  env.R2_ENDPOINT = 'https://r2.example';
+  env.R2_MEDIA_BUCKET = 'blog-media';
+  env.R2_MEDIA_PUBLIC_BASE = 'https://media.example';
+  const og = await import('./functions/_lib/og.js');
+  const r = await og.handleOgUploadUrl(new Request('http://t/api/admin/og-upload-url', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+    body: JSON.stringify({ postId: 'og-post' })
+  }), env);
+  const data = await r.json();
+  assert.strictEqual(r.status, 200);
+  assert.ok(data.uploadUrl && data.publicUrl.indexOf('https://media.example/og/og-post-') === 0);
+  const create = await core.handlePosts(new Request('http://t/api/posts', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+    body: JSON.stringify({ id: 'og-post', title: '分享图文章', content: 'A', ogImage: data.publicUrl })
+  }), env);
+  const created = await create.json();
+  assert.strictEqual(created.post.ogImage, data.publicUrl);
 }]);
 
 tests.push(['API：PUT 更新 / PUT 未知 id 新建 / DELETE / 404 / 无 DB 500', async () => {
@@ -1006,11 +1434,11 @@ tests.push(['R2 直传：预签名绑定 Content-Type（媒体 / 音乐）', asy
   };
   Math.random = () => 0.123456789;
 
-  const uploadResult = async (handler, filename, size, targetEnv) => {
+  const uploadResult = async (handler, filename, size, extra, targetEnv) => {
     const response = await handler(new Request('http://t/api/upload-url', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer upload-test-token' },
-      body: JSON.stringify({ filename, size })
+      body: JSON.stringify(Object.assign({ filename, size }, extra || {}))
     }), targetEnv || env);
     assert.strictEqual(response.status, 200);
     const data = await response.json();
@@ -1019,24 +1447,45 @@ tests.push(['R2 直传：预签名绑定 Content-Type（媒体 / 音乐）', asy
   const signature = (url) => url.searchParams.get('X-Amz-Signature');
 
   try {
-    const mediaUpload = await uploadResult(media.handleMediaUploadUrl, 'photo.png', 12345);
+    const mediaUpload = await uploadResult(media.handleMediaUploadUrl, 'photo.png', 12345, { makeThumb: true });
     assert.strictEqual(mediaUpload.url.searchParams.get('X-Amz-SignedHeaders'), 'content-type;host');
     assert.ok(mediaUpload.url.pathname.startsWith('/test-media/media/'), '图片应写入媒体桶：' + mediaUpload.url.pathname);
     assert.ok(mediaUpload.data.publicUrl.startsWith('https://media.example.com/media/'), '图片公开地址应使用媒体域名：' + mediaUpload.data.publicUrl);
+    assert.ok(mediaUpload.data.thumbUploadUrl && mediaUpload.data.thumbPublicUrl.endsWith('-thumb.webp'), '生成缩略图签名');
 
-    const musicUpload = await uploadResult(music.handleMusicUploadUrl, 'song.mp3', 12345);
+    const musicUpload = await uploadResult(music.handleMusicUploadUrl, 'song.mp3', 12345, null, env);
     assert.strictEqual(musicUpload.url.searchParams.get('X-Amz-SignedHeaders'), 'content-type;host');
     assert.ok(musicUpload.url.pathname.startsWith('/test-music/music/'), '音乐桶可用时音乐应写入音乐桶：' + musicUpload.url.pathname);
     assert.ok(musicUpload.data.publicUrl.startsWith('https://music.example.com/music/'), '音乐公开地址应使用音乐域名：' + musicUpload.data.publicUrl);
 
     const fallbackEnv = Object.assign({}, env, { R2_BUCKET: '', R2_PUBLIC_BASE: '' });
-    const fallbackMusicUpload = await uploadResult(music.handleMusicUploadUrl, 'fallback.mp3', 12345, fallbackEnv);
+    const fallbackMusicUpload = await uploadResult(music.handleMusicUploadUrl, 'fallback.mp3', 12345, null, fallbackEnv);
     assert.ok(fallbackMusicUpload.url.pathname.startsWith('/test-media/music/'), '音乐桶缺失时应回退媒体桶：' + fallbackMusicUpload.url.pathname);
     assert.ok(fallbackMusicUpload.data.publicUrl.startsWith('https://media.example.com/music/'), '回退媒体桶时公开地址应使用媒体域名：' + fallbackMusicUpload.data.publicUrl);
 
     assert.strictEqual(music.extractR2Key('https://media.example.com/music/new.mp3', env), 'music/new.mp3');
     assert.strictEqual(music.extractR2Key('https://music.example.com/music/old.mp3', env), 'music/old.mp3');
     assert.strictEqual(music.extractR2Key('https://evil.example/music/foreign.mp3', env), '');
+
+    const realFetch = global.fetch;
+    const deleted = [];
+    global.fetch = async (url, options) => {
+      deleted.push({ url: String(url), method: options && options.method });
+      return { status: 204, text: async () => '' };
+    };
+    try {
+      await media.deleteMediaObject(
+        env,
+        'https://media.example.com/media/photo.png',
+        'https://media.example.com/media/photo-thumb.webp'
+      );
+    } finally {
+      global.fetch = realFetch;
+    }
+    assert.strictEqual(deleted.length, 2, '删除媒体时同时删除原图与缩略图');
+    assert.ok(deleted.every((item) => item.method === 'DELETE'), '对象清理必须使用 DELETE');
+    assert.ok(deleted[0].url.includes('/test-media/media/photo.png'), '清理原图 R2 对象');
+    assert.ok(deleted[1].url.includes('/test-media/media/photo-thumb.webp'), '清理缩略图 R2 对象');
 
     const key = 'media/fixed-object.png';
     const pngUrl = new URL(await music.presignPut(env, key, 3600, env.R2_MEDIA_BUCKET, 'image/png'));
@@ -1067,6 +1516,32 @@ tests.push(['详情页：标签链接可点击、复制链接按钮、阅读时�
   assert.ok(d.html.includes('data-tag-link'), '标签链接元素存在（修复绑定范围问题）');
   assert.ok(d.html.includes('btnCopyLink'), '复制链接按钮');
   assert.ok(d.html.includes('分钟阅读'), '阅读时长');
+}]);
+
+tests.push(['详情页：分享菜单（复制链接 / 系统分享 / 社交平台）', async () => {
+  const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/hello-qingyu/');
+  assert.ok(d.html.includes('id="btnShare"'), '分享按钮存在');
+  assert.ok(d.html.includes('id="shareMenu"'), '分享菜单容器存在');
+  assert.ok(d.html.includes('data-share="copy"'), '复制链接项');
+  assert.ok(d.html.includes('data-share="weibo"'), '微博分享项');
+  assert.ok(d.html.includes('data-share="x"'), 'X 分享项');
+  assert.ok(d.html.includes('data-share="facebook"'), 'Facebook 分享项');
+  assert.ok(d.html.includes('data-share="telegram"'), 'Telegram 分享项');
+  assert.ok(d.html.includes('data-share="email"'), '邮件分享项');
+}]);
+
+tests.push(['站点公告：开启后前台渲染，含链接与关闭按钮', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.ctx._siteSettings = { site_info: JSON.stringify({ announceEnabled: true, announceText: '本站已完成升级', announceLink: '/about', announceLinkText: '了解更多', announceClosable: true }) };
+  await b.ctx.route();
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html.includes('id="announceBar"'), '渲染公告栏');
+  assert.ok(html.includes('本站已完成升级'), '公告文字');
+  assert.ok(html.includes('data-announce-close'), '关闭按钮');
+  assert.ok(html.includes('class="announce-link"'), '公告链接');
+  b.ctx._siteSettings = { site_info: JSON.stringify({ announceEnabled: false, announceText: 'x' }) };
+  await b.ctx.route();
+  assert.ok(!b.ctx.document.querySelector('#app').innerHTML.includes('announce-bar'), '未开启时不渲染');
 }]);
 
 tests.push(['非法路径不崩溃（decodeURIComponent 防护）', async () => {
@@ -1182,6 +1657,68 @@ tests.push(['API：评论 POST / GET / 校验 / 删除（需令牌）', async ()
   assert.strictEqual(after.comments.length, 2, '删除后剩 2 条');
 }]);
 
+tests.push(['评论互动：点赞自增 / 置顶精选排序 / 未登录不可改', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  const post = (pid, body) => core.handleComments(new Request('http://t/api/posts/' + pid + '/comments', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  }), env, pid);
+  const a = (await (await post('ci', { author: 'A', content: '第一条' })).json()).comment;
+  const b = (await (await post('ci', { author: 'B', content: '第二条' })).json()).comment;
+  const c = (await (await post('ci', { author: 'C', content: '第三条' })).json()).comment;
+
+  // 点赞：第一次返回 1，第二次返回 2
+  let r = await core.handleCommentLike(new Request('http://t/api/comments/' + c.id + '/like', { method: 'POST' }), env, c.id);
+  assert.strictEqual(r.status, 200, '点赞 200');
+  assert.strictEqual((await r.json()).likes, 1, '第一次点赞 = 1');
+  r = await core.handleCommentLike(new Request('http://t/api/comments/' + c.id + '/like', { method: 'POST' }), env, c.id);
+  assert.strictEqual((await r.json()).likes, 2, '第二次点赞 = 2');
+
+  // 点赞不存在的评论 → 404
+  const miss = await core.handleCommentLike(new Request('http://t/api/comments/nope/like', { method: 'POST' }), env, 'nope');
+  assert.strictEqual(miss.status, 404, '点赞不存在评论 404');
+
+  // 未登录不能改置顶 / 精选
+  let pu = await core.handleCommentUpdate(new Request('http://t/api/comments/' + a.id, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pinned: true })
+  }), env, a.id);
+  assert.strictEqual(pu.status, 401, '未登录改置顶 401');
+
+  // 有令牌可置顶 / 精选
+  env.BLOG_WRITE_TOKEN = 'tok-cmt';
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer tok-cmt' };
+  pu = await core.handleCommentUpdate(new Request('http://t/api/comments/' + a.id, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ pinned: true })
+  }), env, a.id);
+  assert.strictEqual(pu.status, 200, '置顶成功');
+  await core.handleCommentUpdate(new Request('http://t/api/comments/' + b.id, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ featured: true })
+  }), env, b.id);
+
+  // 前台排序：置顶 > 精选 > 点赞 > 写入顺序
+  const ordering = await (await core.handleComments(new Request('http://t/api/posts/ci/comments'), env, 'ci')).json();
+  assert.strictEqual(ordering.comments[0].id, a.id, '置顶排最前');
+  assert.strictEqual(ordering.comments[1].id, b.id, '精选排第二');
+  assert.strictEqual(ordering.comments[2].id, c.id, '高赞排第三');
+
+  // 后台列表返回点赞 / 置顶 / 精选字段（含文章标题连接）
+  const admin = await (await core.handleCommentsList(new Request('http://t/api/comments?status=all', {
+    headers: { Authorization: 'Bearer tok-cmt' }
+  }), env)).json();
+  assert.strictEqual(admin.comments.length, 3, '后台列表 3 条');
+  const rowC = admin.comments.filter((x) => x.id === c.id)[0];
+  assert.strictEqual(Number(rowC.likes), 2, '后台列表带点赞数');
+  const rowA = admin.comments.filter((x) => x.id === a.id)[0];
+  assert.strictEqual(Number(rowA.pinned), 1, '后台列表带置顶状态');
+
+  // 取消置顶后就地更新
+  await core.handleCommentUpdate(new Request('http://t/api/comments/' + a.id, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ pinned: false })
+  }), env, a.id);
+  const ordering2 = await (await core.handleComments(new Request('http://t/api/posts/ci/comments'), env, 'ci')).json();
+  assert.strictEqual(ordering2.comments[0].id, b.id, '取消置顶后精选顶到最前');
+}]);
+
 tests.push(['留言板（云端）：合成 id gb-note/gb-idea 复用评论管道，持久化 + 来源校验', async () => {
   const core = await import('./functions/_lib/api-core.js');
   const env = mockEnv();
@@ -1284,6 +1821,148 @@ tests.push(['评论（静态模式）：保存在本浏览器并渲染', async (
   // 详情页包含评论区结构
   const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/hello-qingyu/');
   assert.ok(d.html.includes('comment-list') && d.html.includes('发表评论'), '评论表单在详情页');
+}]);
+
+tests.push(['评论（前端）：点赞按钮 / 置顶精选徽章 / commentSort 排序', async () => {
+  const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  const list = [
+    { id: 'c1', author: '小甲', content: '普通评论', date: '2026-01-01' },
+    { id: 'c2', author: '小乙', content: '置顶评论', date: '2026-01-02', pinned: 1 },
+    { id: 'c3', author: '小丙', content: '精选评论', date: '2026-01-03', featured: 1 },
+    { id: 'c4', author: '小丁', content: '高赞评论', date: '2026-01-04', likes: 5 }
+  ];
+  const html = ctx.renderCommentTree(list, false);
+  assert.ok(html.includes('comment-like'), '渲染点赞按钮');
+  assert.ok(html.includes('data-like-id="c1"'), '点赞按钮携带评论 id');
+  assert.ok(html.includes('comment-badge pinned'), '渲染置顶徽章');
+  assert.ok(html.includes('comment-badge featured'), '渲染精选徽章');
+  assert.ok(html.includes('class="comment pinned') || html.includes('comment pinned'), '置顶评论带状态类');
+  // 排序：置顶 > 精选 > 点赞 > 普通
+  const sorted = list.slice().sort(ctx.commentSort).map((x) => x.id).join(',');
+  assert.strictEqual(sorted, 'c2,c3,c4,c1', 'commentSort 排序正确');
+  assert.ok(typeof ctx.handleCommentLikeClick !== 'undefined' || html.includes('comment-like'), '点赞交互已接入');
+}]);
+
+tests.push(['评论（前端）：最新/最热排序、顶层分页与加载更多', async () => {
+  const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  const list = [];
+  for (let i = 1; i <= 20; i++) list.push({ id: 'c' + i, author: 'u' + i, content: 'x' + i, date: '2026-01-01', likes: i, rid: i });
+  assert.strictEqual(ctx.commentRootCount(list), 20, '顶层评论计数');
+  assert.strictEqual(list.slice().sort(ctx.commentSort)[0].id, 'c20', '最热按点赞排序');
+  const fresh = list.slice().sort(ctx.commentSortNew).map((c) => c.id);
+  assert.strictEqual(fresh[0], 'c20', '最新按写入顺序倒序');
+  assert.strictEqual(fresh[19], 'c1', '最新末尾是最早');
+  const html = ctx.renderCommentTree(list, false, { sorter: ctx.commentSort, limit: 8 });
+  assert.strictEqual((html.match(/class="comment"/g) || []).length, 8, '只渲染前 8 条顶层评论');
+  const withReply = list.slice(0, 3).concat([{ id: 'r1', author: 'r', content: 'reply', parent_id: 'c3', rid: 99 }]);
+  assert.strictEqual(ctx.commentRootCount(withReply), 3, '回复不计入顶层数量');
+  const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/hello-qingyu/');
+  assert.ok(d.html.includes('id="commentSort"') && d.html.includes('data-sort="new"'), '排序切换入口');
+  assert.ok(d.html.includes('id="commentMore"'), '加载更多容器');
+}]);
+
+tests.push(['阅读体验：正文字号调节 + 移动端浮动目录', async () => {
+  const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/markdown-cheatsheet/');
+  assert.ok(d.html.includes('class="reading-tools"'), '字号调节控件');
+  assert.ok(d.html.includes('data-rs="1"'), 'A+ 按钮');
+  assert.ok(d.html.includes('id="tocFab"'), '浮动目录按钮');
+  assert.ok(d.html.includes('id="tocSheet"'), '目录抽屉');
+  assert.strictEqual(d.ctx.setReadingScale(1.2), 1.2, '字号 1.2');
+  assert.strictEqual(d.ctx.getReadingScale(), 1.2, '读回字号');
+  assert.strictEqual(d.ctx.setReadingScale(99), 1.5, '字号上限 1.5');
+  assert.strictEqual(d.ctx.setReadingScale(0.1), 0.85, '字号下限 0.85');
+  d.ctx.setReadingScale(1);
+}]);
+
+tests.push(['后台媒体库：搜索 / 分页 / 批量删除 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abMediaKw'), '搜索框');
+  assert.ok(src.includes('abMediaBatchDel'), '批量删除按钮');
+  assert.ok(src.includes('abMediaPage'), '分页容器');
+  assert.ok(src.includes('renderMediaGrid'), '网格渲染函数');
+  assert.ok(src.includes('batchDeleteMedia'), '批量删除逻辑');
+  assert.ok(src.includes('ab-media-check'), '单项勾选框');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-media-check'), '选择框样式');
+}]);
+
+tests.push(['后台订阅者：搜索 / 状态筛选 / 分页 / 导出 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abSubKw'), '搜索框');
+  assert.ok(src.includes('abSubStatus'), '状态筛选');
+  assert.ok(src.includes('abSubPage'), '分页容器');
+  assert.ok(src.includes('filteredSubscribers'), '筛选逻辑');
+  assert.ok(src.includes('renderSubscribers'), '列表渲染');
+  assert.ok(src.includes('subState'), '分页状态');
+}]);
+
+tests.push(['后台文章列表：批量置顶 / 取消置顶 / 删除 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abPostBulk'), '批量操作条');
+  assert.ok(src.includes('abPostAll'), '本页全选');
+  assert.ok(src.includes('bulkPinPosts'), '批量置顶逻辑');
+  assert.ok(src.includes('bulkDeletePosts'), '批量删除逻辑');
+  assert.ok(src.includes('data-pick'), '行内勾选框');
+  assert.ok(src.includes('syncPostSelection'), '选中态同步');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-bulk'), '批量条样式');
+}]);
+
+tests.push(['编辑器工具栏：表格 / 任务列表 / 分割线 / 代码块语言 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('data-md="table"'), '表格按钮');
+  assert.ok(src.includes('data-md="task"'), '任务列表按钮');
+  assert.ok(src.includes('data-md="hr"'), '分割线按钮');
+  assert.ok(src.includes('data-md="codeblock"'), '代码块按钮');
+  assert.ok(src.includes('abMdLang'), '代码块语言选择器');
+  assert.ok(src.includes("type === 'table'") && src.includes("type === 'codeblock'"), '插入逻辑');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-tool-select'), '语言选择器样式');
+}]);
+
+tests.push(['编辑器：字数统计 / 阅读时长 / 快捷键 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abEditorStats'), '统计条 DOM');
+  assert.ok(src.includes('editorCounts') && src.includes('updateEditorStats'), '字数统计逻辑');
+  assert.ok(src.includes("k === 's'"), 'Ctrl+S 存草稿');
+  assert.ok(src.includes("k === 'k'"), 'Ctrl+K 链接');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-editor-stats'), '统计条样式');
+}]);
+
+tests.push(['后台媒体库：大图预览与复制 Markdown 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('data-preview'), '缩略图预览入口');
+  assert.ok(src.includes('data-mdimg'), '复制 Markdown 按钮');
+  assert.ok(src.includes('openMediaLightbox') && src.includes('stepMediaLightbox'), '灯箱逻辑');
+  assert.ok(src.includes('ab-lb-counter'), '灯箱计数');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-lightbox') && acss.includes('.ab-lb-nav'), '灯箱样式');
+}]);
+
+tests.push(['后台音乐管理：搜索与分页 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abMusicKw'), '搜索框');
+  assert.ok(src.includes('abMusicPage'), '分页容器');
+  assert.ok(src.includes('musicFiltered') && src.includes('renderMusicList'), '过滤与分页渲染');
+  assert.ok(src.includes('musicState'), '分页状态');
+}]);
+
+tests.push(['后台备份：列表分页与内容摘要 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abBackupPage'), '分页容器');
+  assert.ok(src.includes('renderBackups'), '分页渲染');
+  assert.ok(src.includes('backupCountsHtml'), '内容摘要');
+  assert.ok(src.includes('backupState'), '分页状态');
+  assert.ok(src.includes('admin.backup.total'), '总数文案');
+}]);
+
+tests.push(['后台仪表盘：存储与订阅概览卡片 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abStorageCard'), '概览卡片容器');
+  assert.ok(src.includes('loadStorageOverview'), '概览加载函数');
+  assert.ok(src.includes('admin.dashboard.sMedia') && src.includes('admin.dashboard.sBackups'), '概览指标文案');
+  assert.ok(src.includes("api('api/admin/subscribers')") && src.includes("api('api/admin/backups')"), '数据来源');
 }]);
 
 tests.push(['加密：服务端 PBKDF2 哈希往返验证', async () => {
@@ -1553,11 +2232,11 @@ tests.push(['保存文件：系统对话框原地覆盖，不支持时回退下�
 
 tests.push(['导航渲染：默认主导航 + resolveNav 支持 i18n/直接文本/子菜单/外链', async () => {
   const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
-  // 默认主导航渲染：5 项（首页/标签/归档/留言/关于）
+  // 默认主导航渲染：7 项（首页/标签/系列/热门/归档/留言/关于）
   const mainNav = (b.html.match(/<nav class="main-nav">.*?<\/nav>/s) || [''])[0];
   assert.ok(mainNav.includes('>首页<') || mainNav.includes('>Home<'), '默认导航含首页（i18n）');
   assert.ok(mainNav.includes('>归档<') || mainNav.includes('>Archive<'), '默认导航含归档');
-  assert.ok((mainNav.match(/nav-link/g) || []).length >= 5, '默认导航至少 5 个链接');
+  assert.ok((mainNav.match(/nav-link/g) || []).length >= 7, '默认导航至少 7 个链接');
   assert.ok(!mainNav.includes('target="_blank"'), '默认导航全为站内链接（无外链）');
   // resolveNav 支持直接 text（无 i18n key）与子菜单（自定义导航移除后解析器仍保留该能力）
   const items = [
@@ -1575,9 +2254,9 @@ tests.push(['导航渲染：默认主导航 + resolveNav 支持 i18n/直接文�
   assert.strictEqual(resolved[1].children[0].text, '写作', '子项 text 生效');
   assert.strictEqual(resolved[1].children[1].url, 'https://friend.example', '子项外链保留');
   assert.ok(resolved[2].text, 'i18n key 解析出文本（' + resolved[2].text + '）');
-  // 默认 NAV 常量解析后 5 项且不崩溃
+  // 默认 NAV 常量解析后 7 项且不崩溃
   const def = b.ctx.resolveNav(b.ctx.NAV);
-  assert.strictEqual(def.length, 5, '默认 NAV 5 项');
+  assert.strictEqual(def.length, 7, '默认 NAV 7 项');
 }]);
 
 tests.push(['导航翻译：旧后台自定义导航在切换语言后内置项自动翻译、自定义文本保留', async () => {
@@ -1663,6 +2342,50 @@ tests.push(['index.html：静态 base 在资源之前 + 首屏加载动画存在
   assert.ok(!html.includes('id="dynBase"'), '旧的动态 base 脚本已移除');
 }]);
 
+tests.push(['沉浸式阅读：进度条 / 目录跟随 / 图片灯箱', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/hello-qingyu/');
+  assert.ok(b.html.includes('id="readingProgress"'), '文章页渲染阅读进度条');
+  assert.ok(typeof b.ctx.updateReadingProgress === 'function', '阅读进度更新函数已暴露');
+  assert.ok(typeof b.ctx.updateTocActive === 'function', '目录跟随函数已暴露');
+  assert.ok(typeof b.ctx.openLightbox === 'function' && typeof b.ctx.closeLightbox === 'function', '图片灯箱控制函数已暴露');
+  const css = fs.readFileSync(path.join(PUB, 'style.css'), 'utf8');
+  assert.ok(css.includes('.lightbox-overlay') && css.includes('.reading-progress') && css.includes('.toc-list a.active'), '阅读增强样式齐全');
+}]);
+
+tests.push(['热门文章：路由 / 排行数据 / 时间范围入口', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/popular');
+  assert.strictEqual(b.ctx.currentRoute().path, '/popular', '热门页路由解析正确');
+  assert.ok(b.html.includes('id="popularList"') && b.html.includes('热门文章'), '热门页主体已渲染');
+  assert.ok(typeof b.ctx.loadPopular === 'function' && typeof b.ctx.renderPopularList === 'function', '热门排行函数已暴露');
+}]);
+tests.push(['后台：文章数据分析页已完整接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('function pageAnalytics') && src.includes('abAnalyticsSummary') && src.includes('abAnalyticsBody'), '分析页主体已接入');
+  assert.ok(src.includes("key: 'analytics'") && src.includes("href: '/admin/analytics'"), '侧边栏分析入口已接入');
+  assert.ok(src.includes('api/admin/post-analytics'), '分析接口已接线');
+  assert.ok(src.includes('analyticsSparkline') && src.includes('exportAnalyticsCsv'), '趋势图和 CSV 导出已接入');
+}]);
+tests.push(['PWA：安装清单 / 图标 / Service Worker 配置齐全', async () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(PUB, 'manifest.webmanifest'), 'utf8'));
+  assert.strictEqual(manifest.display, 'standalone');
+  assert.ok(Array.isArray(manifest.icons) && manifest.icons.length >= 2, '包含安装图标');
+  assert.ok(manifest.icons.some((icon) => String(icon.purpose || '').includes('maskable')), '包含 maskable 安装图标');
+  const pngSize = (name) => {
+    const buf = fs.readFileSync(path.join(PUB, 'icons', name));
+    assert.strictEqual(buf.slice(1, 4).toString('ascii'), 'PNG');
+    return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+  };
+  assert.deepStrictEqual(pngSize('icon-192.png'), { w: 192, h: 192 });
+  assert.deepStrictEqual(pngSize('icon-512.png'), { w: 512, h: 512 });
+  assert.deepStrictEqual(pngSize('icon-512-maskable.png'), { w: 512, h: 512 });
+  const sw = fs.readFileSync(path.join(PUB, 'sw.js'), 'utf8');
+  assert.ok(sw.includes("'/api/posts'") && sw.includes('Authorization') && sw.includes('ignoreSearch'), '公开文章离线缓存策略存在');
+  const index = fs.readFileSync(path.join(PUB, 'index.html'), 'utf8');
+  assert.ok(index.includes('rel="manifest"') && index.includes('serviceWorker.register'), '入口接入 PWA 清单与 Service Worker');
+  const worker = fs.readFileSync(path.join(process.cwd(), 'worker.js'), 'utf8');
+  assert.ok(worker.includes('Service-Worker-Allowed') && worker.includes('/manifest.webmanifest'), 'Worker 静态响应包含 PWA 缓存头');
+}]);
+
 tests.push(['导航栏搜索：图标点击展开，实时命中并带摘要', async () => {
   const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
   const hits = ctx.globalSearch('你好', 8);
@@ -1672,6 +2395,26 @@ tests.push(['导航栏搜索：图标点击展开，实时命中并带摘要', a
   // 无关键词返回空
   assert.strictEqual(ctx.globalSearch('', 8).length, 0, '空关键词无结果');
 }]);
+
+tests.push(['双向链接：Wiki 语法解析、反向链接与相关文章', async () => {
+  const posts = [
+    { id: 'rel-target', title: '目标文章', date: '2026-01-03', content: '目标正文', tags: ['共享'], series: '系列', status: 'published' },
+    { id: 'rel-related', title: '相关文章', date: '2026-01-02', content: '共同标签', tags: ['共享'], status: 'published' },
+    { id: 'rel-backlink', title: '引用文章', date: '2026-01-01', content: '参见 [[目标文章]]', tags: ['其他'], status: 'published' },
+    { id: 'rel-markdown', title: 'Markdown 引用', date: '2025-12-31', content: '阅读 [目标文章](/posts/rel-target/)', tags: ['其他'], status: 'published' }
+  ];
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' }, 'window.BLOG_POSTS': posts }, '/posts/rel-target/');
+  const wiki = b.ctx.renderMarkdown('参见 [[相关文章|相关]]');
+  assert.ok(wiki.includes('class="wiki-link"') && wiki.includes('/posts/rel-related/'), 'Wiki 链接解析为站内文章链接');
+  assert.ok(b.ctx.renderMarkdown('[[不存在的文章]]').includes('wiki-link missing'), '未知 Wiki 链接显示缺失样式');
+  const rel = b.ctx.getLocalPostRelations('rel-target');
+  assert.ok(rel.related.some((p) => p.id === 'rel-related'), '共同标签文章进入相关推荐');
+  assert.ok(rel.backlinks.some((p) => p.id === 'rel-backlink'), 'Wiki 引用进入反向链接');
+  assert.ok(rel.backlinks.some((p) => p.id === 'rel-markdown'), 'Markdown 站内链接进入反向链接');
+  assert.ok(b.html.includes('id="postRelations"'), '详情页预留双向链接区域');
+  assert.ok(b.ctx.renderRelationsHtml(rel).includes('引用本文'), '双向链接区域包含反向链接标题');
+}]);
+
 
 tests.push(['file:// 本地预览：顶部导航与页脚链接均为 hash 且点击可跳转', async () => {
   // 构造 file:// 环境（本地双击 index.html 直开）
@@ -1738,6 +2481,19 @@ tests.push(['标签页：标签云 + 计数 + 点击进入筛选', async () => {
   // 筛选态标签高亮
   const f = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/tags');
   void f;
+}]);
+
+tests.push(['系列页：分组、顺序与详情导航', async () => {
+  const posts = [
+    { id: 's2', title: '系列第二篇', date: '2026-02-02', series: '测试系列', seriesOrder: 2, content: 'B', tags: [] },
+    { id: 's1', title: '系列第一篇', date: '2026-02-01', series: '测试系列', seriesOrder: 1, content: 'A', tags: [] },
+    { id: 'other', title: '普通文章', date: '2026-02-03', content: 'C', tags: [] }
+  ];
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' }, 'window.BLOG_POSTS': posts }, '/series');
+  assert.ok(b.html.includes('测试系列') && b.html.includes('2 篇文章'), '系列列表分组计数');
+  const detail = b.ctx.renderSeriesDetail('测试系列');
+  assert.ok(detail.indexOf('系列第一篇') < detail.indexOf('系列第二篇'), '系列内按 seriesOrder 升序');
+  assert.ok(detail.includes('测试系列'), '系列详情标题正确');
 }]);
 
 tests.push(['API：RSS /api/feed.xml 生成与 XML 转义', async () => {

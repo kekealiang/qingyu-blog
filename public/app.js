@@ -6,7 +6,7 @@
  * ============================================================================ */
 'use strict';
 
-var BLOG_VERSION = '2.7.2';
+var BLOG_VERSION = '2.10.18';
 
 /* ---------- 全局缓存 ---------- */
 var _searchOpen = false;   // 顶部导航搜索是否展开
@@ -145,6 +145,27 @@ function applyTheme(t) {
 function setTheme(t) { applyTheme(t); try { localStorage.setItem(themeKey(), t); } catch (e) {} }
 function toggleTheme() { var n = getTheme() === 'dark' ? 'light' : 'dark'; setTheme(n); refreshThemeIcon(); renderAccentSwatches(); renderAccentNativeSelect(); return n; }
 /* 统一 SVG 图标：currentColor 描边，自动继承文字色、hover 变主题色 */
+/* ---------- 正文字号（A- / A / A+）：本地记忆，跨页面生效 ---------- */
+var READING_SCALE_KEY = 'qingyu.readingScale';
+function getReadingScale() {
+  var v = 1;
+  try { v = Number(localStorage.getItem(READING_SCALE_KEY)) || 1; } catch (e) {}
+  if (!(v >= 0.85 && v <= 1.5)) v = 1;
+  return Math.round(v * 100) / 100;
+}
+function applyReadingScale(scale) {
+  var v = (scale === undefined) ? getReadingScale() : scale;
+  v = Math.max(0.85, Math.min(1.5, Number(v) || 1));
+  v = Math.round(v * 100) / 100;
+  try { document.documentElement.style.setProperty('--reading-scale', String(v)); } catch (e) {}
+  return v;
+}
+function setReadingScale(scale) {
+  var v = applyReadingScale(scale);
+  try { localStorage.setItem(READING_SCALE_KEY, String(v)); } catch (e) {}
+  return v;
+}
+
 function svgIcon(name, size) {
   size = size || 18;
   var s = 'width="' + size + '" height="' + size + '"';
@@ -168,6 +189,7 @@ function svgIcon(name, size) {
     question: '<svg ' + s + ' ' + c + '><circle cx="12" cy="12" r="9"/><path d="M9.2 9.6a2.8 2.8 0 0 1 5.4 1c0 1.8-2.6 2-2.6 3.6M12 17h.01"/></svg>',
     doc: '<svg ' + s + ' ' + c + '><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4M9.5 12h5M9.5 15h5"/></svg>',
     top: '<svg ' + s + ' ' + c + '><path d="M12 20V6"/><path d="M6 11.5 12 5.5l6 6"/></svg>',
+    'arrow-left': '<svg ' + s + ' ' + c + '><path d="M19 12H5M11 6l-6 6 6 6"/></svg>',
     pen: '<svg ' + s + ' ' + c + '><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
     logout: '<svg ' + s + ' ' + c + '><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>',
     trash: '<svg ' + s + ' ' + c + '><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13M10 11v6M14 11v6"/></svg>',
@@ -181,6 +203,7 @@ function svgIcon(name, size) {
     palette: '<svg ' + s + ' ' + c + '><path d="M12 3a9 9 0 1 0 5.4 16.2A2.4 2.4 0 0 0 15.6 17h-.9a2.6 2.6 0 0 1-2.6-2.6c0-1.4 1.1-2.6 2.6-2.6h1.4A3.9 3.9 0 0 0 20.2 8 9 9 0 0 0 12 3z"/><circle cx="7.4" cy="11.3" r="1"/><circle cx="10.6" cy="7.2" r="1"/><circle cx="15.4" cy="8.6" r="1"/></svg>',
     globe: '<svg ' + s + ' ' + c + '><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15.5 15.5 0 0 1 0 18M12 3a15.5 15.5 0 0 0 0 18"/></svg>',
     spark: '<svg ' + s + ' ' + c + '><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg>',
+    star: '<svg ' + s + ' ' + c + '><path d="M12 3.4l2.6 5.3 5.8.9-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.6l5.8-.9z"/></svg>',
     copy: '<svg ' + s + ' ' + c + '><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
     music: '<svg ' + s + ' ' + c + '><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
     play: '<svg ' + s + ' ' + c + '><path d="M7 4.5v15l13-7.5z"/></svg>',
@@ -596,6 +619,15 @@ function inlineMd(s) {
     if (/^\s*(javascript|data|vbscript):/i.test(String(url).trim())) return m;
     return '<a href="' + url + '">' + txt + '</a>';
   });
+  // Wiki 双向链接：[[文章标题]] 或 [[文章标题|显示文字]]
+  t = t.replace(/\[\[([^\[\]\n]{1,160})\]\]/g, function (m, raw) {
+    var parts = String(raw || '').split('|');
+    var target = String(parts[0] || '').trim().replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    var label = String(parts.length > 1 ? parts[1] : parts[0] || '').trim();
+    var hit = resolveWikiLink(target);
+    if (!hit) return '<span class="wiki-link missing">' + label + '</span>';
+    return '<a class="wiki-link" href="' + esc(href(postUrl(hit.id))) + '">' + label + '</a>';
+  });
   // 恢复遮罩
   t = t.replace(/\u0001([*_`~\[\]])/g, '$1');
   return t;
@@ -643,6 +675,142 @@ function stampHeadingNumbers(headings) {
   });
 }
 
+/* ---------- 阅读进度 / 目录跟随 / 图片灯箱 ---------- */
+var _articleResizeBound = false;
+var _lightboxKeyBound = false;
+var _lightbox = { images: [], index: 0, el: null, lastFocus: null, prevOverflow: '' };
+
+function updateReadingProgress() {
+  var bar = document.querySelector('#readingProgress span');
+  var article = document.querySelector('.article');
+  if (!bar || !article) return;
+  var scrollY = (typeof window !== 'undefined' && typeof window.scrollY === 'number')
+    ? window.scrollY
+    : ((typeof window !== 'undefined' && typeof window.pageYOffset === 'number') ? window.pageYOffset : 0);
+  var rect = article.getBoundingClientRect ? article.getBoundingClientRect() : { top: 0, height: 0 };
+  var top = Number(rect.top || 0) + scrollY;
+  var height = Number(article.offsetHeight || rect.height || 0);
+  var viewport = Number((typeof window !== 'undefined' && window.innerHeight) || (document.documentElement && document.documentElement.clientHeight) || 0);
+  var end = Math.max(top + 1, top + height - viewport);
+  var progress = height <= viewport ? (scrollY >= top ? 1 : 0) : (scrollY - top) / (end - top);
+  progress = Math.max(0, Math.min(1, progress));
+  bar.style.transform = 'scaleX(' + progress + ')';
+}
+
+function updateTocActive() {
+  var links = document.querySelectorAll('a[data-toc]');
+  if (!links || !links.length) return;
+  var active = null;
+  links.forEach(function (link) {
+    var href = link.getAttribute('href') || '';
+    var heading = href.charAt(0) === '#' ? document.getElementById(href.slice(1)) : null;
+    if (!heading || !heading.getBoundingClientRect) return;
+    if (heading.getBoundingClientRect().top <= 150) active = link;
+  });
+  links.forEach(function (link) {
+    if (!link.classList) return;
+    if (link === active) link.classList.add('active');
+    else link.classList.remove('active');
+  });
+}
+
+function ensureLightbox() {
+  if (_lightbox.el) return _lightbox.el;
+  var overlay = document.createElement('div');
+  overlay.className = 'lightbox-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-hidden', 'true');
+  overlay.innerHTML = '<button type="button" class="lightbox-close" aria-label="' + esc(t('lightbox.close')) + '">✕</button>'
+    + '<button type="button" class="lightbox-nav lightbox-prev" aria-label="' + esc(t('lightbox.prev')) + '">‹</button>'
+    + '<img class="lightbox-image" alt="">'
+    + '<div class="lightbox-counter"></div>'
+    + '<button type="button" class="lightbox-nav lightbox-next" aria-label="' + esc(t('lightbox.next')) + '">›</button>';
+  overlay.addEventListener('click', function (e) {
+    var target = e.target;
+    if (target === overlay || (target && target.classList && target.classList.contains('lightbox-close'))) { closeLightbox(); return; }
+    if (target && target.classList && target.classList.contains('lightbox-prev')) { showLightbox(_lightbox.index - 1); return; }
+    if (target && target.classList && target.classList.contains('lightbox-next')) { showLightbox(_lightbox.index + 1); }
+  });
+  document.body.appendChild(overlay);
+  _lightbox.el = overlay;
+  return overlay;
+}
+
+function showLightbox(index) {
+  if (!_lightbox.images.length || !_lightbox.el) return;
+  var total = _lightbox.images.length;
+  _lightbox.index = (index + total) % total;
+  var source = _lightbox.images[_lightbox.index];
+  var image = _lightbox.el.querySelector('.lightbox-image');
+  var counter = _lightbox.el.querySelector('.lightbox-counter');
+  var prev = _lightbox.el.querySelector('.lightbox-prev');
+  var next = _lightbox.el.querySelector('.lightbox-next');
+  if (image) {
+    image.src = source.currentSrc || source.src || '';
+    image.alt = source.alt || '';
+  }
+  if (counter) counter.textContent = t('lightbox.counter', { current: _lightbox.index + 1, total: total });
+  if (prev) prev.style.visibility = total > 1 ? 'visible' : 'hidden';
+  if (next) next.style.visibility = total > 1 ? 'visible' : 'hidden';
+}
+
+function openLightbox(index, imageEl) {
+  var article = document.querySelector('.article');
+  if (!article || !article.querySelectorAll) return;
+  var images = Array.prototype.slice.call(article.querySelectorAll('img')).filter(function (img) { return img && !img.classList.contains('smoji-inline') && (img.currentSrc || img.src); });
+  var start = images.indexOf(imageEl);
+  if (start < 0 && typeof index === 'number') start = index;
+  if (start < 0 || !images.length) return;
+  _lightbox.images = images;
+  _lightbox.lastFocus = document.activeElement || null;
+  _lightbox.prevOverflow = document.body && document.body.style ? document.body.style.overflow : '';
+  if (document.body && document.body.style) document.body.style.overflow = 'hidden';
+  var overlay = ensureLightbox();
+  overlay.classList.add('open');
+  overlay.setAttribute('aria-hidden', 'false');
+  showLightbox(start);
+  var close = overlay.querySelector('.lightbox-close');
+  if (close && close.focus) close.focus();
+}
+
+function closeLightbox() {
+  if (!_lightbox.el) return;
+  _lightbox.el.classList.remove('open');
+  _lightbox.el.setAttribute('aria-hidden', 'true');
+  if (document.body && document.body.style) document.body.style.overflow = _lightbox.prevOverflow || '';
+  _lightbox.images = [];
+  if (_lightbox.lastFocus && _lightbox.lastFocus.focus) _lightbox.lastFocus.focus();
+  _lightbox.lastFocus = null;
+}
+
+function bindArticleEnhancements() {
+  var article = document.querySelector('.article');
+  if (article && article.querySelectorAll) {
+    Array.prototype.slice.call(article.querySelectorAll('img')).filter(function (img) { return !img.classList.contains('smoji-inline'); }).forEach(function (img, index) {
+      img.classList.add('lightbox-source');
+      img.addEventListener('click', function (e) {
+        e.preventDefault();
+        openLightbox(index, img);
+      });
+    });
+  }
+  updateReadingProgress();
+  updateTocActive();
+  if (!_articleResizeBound && typeof window !== 'undefined' && window.addEventListener) {
+    _articleResizeBound = true;
+    window.addEventListener('resize', function () { updateReadingProgress(); updateTocActive(); }, { passive: true });
+  }
+  if (!_lightboxKeyBound && typeof document !== 'undefined' && document.addEventListener) {
+    _lightboxKeyBound = true;
+    document.addEventListener('keydown', function (e) {
+      if (!_lightbox.el || !_lightbox.el.classList.contains('open')) return;
+      if (e.key === 'Escape') closeLightbox();
+      else if (e.key === 'ArrowLeft') showLightbox(_lightbox.index - 1);
+      else if (e.key === 'ArrowRight') showLightbox(_lightbox.index + 1);
+    });
+  }
+}
 /* ---------- 配置与数据 ---------- */
 // 云端模式下从 D1 加载的运行时站点设置（由 bootstrap 拉取并合并进 getConfig）
 var _siteSettings = null;
@@ -708,7 +876,7 @@ function getStaticPosts() {
 
 /** 仅返回已发布文章（过滤草稿），用于前台公开页面（首页/归档/标签/关于/搜索等） */
 function getPublishedPosts() {
-  return getStaticPosts().filter(function (p) { return (p.status || 'published') !== 'draft'; });
+  return getStaticPosts().filter(function (p) { return (p.status || 'published') === 'published'; });
 }
 
 function slug(s) { return String(s || '').toLowerCase().replace(/[^\w\u4e00-\u9fa5-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64); }
@@ -790,16 +958,38 @@ function sortPagePosts(posts) {
 }
 
 /* ---------- 搜索 ---------- */
-function globalSearch(query, limit) {
+function localSearchHits(query) {
   var q = String(query || '').trim().toLowerCase();
   if (!q) return [];
   var posts = sortPagePosts(getPublishedPosts());
   var hits = [];
   posts.forEach(function (p) {
-    var hay = ((p.search || '') + ' ' + (p.title || '') + ' ' + (p.excerpt || '') + ' ' + (p.content || '') + ' ' + (p.tags || []).join(' ')).toLowerCase();
+    var tags = Array.isArray(p.tags) ? p.tags.join(' ') : String(p.tags || '');
+    var hay = ((p.search || '') + ' ' + (p.title || '') + ' ' + (p.excerpt || '') + ' ' + (p.content || '') + ' ' + tags).toLowerCase();
     if (hay.indexOf(q) >= 0) hits.push(p);
   });
-  return hits.slice(0, limit || 8);
+  return hits;
+}
+function globalSearch(query, limit, offset) {
+  var hits = localSearchHits(query);
+  var size = (limit === undefined || limit === null) ? 8 : Math.max(0, Number(limit) || 0);
+  var start = Math.max(0, Number(offset) || 0);
+  return hits.slice(start, start + size);
+}
+function globalSearchTotal(query) {
+  return localSearchHits(query).length;
+}
+function searchLocalPage(query, page) {
+  var size = 10;
+  var p = Math.max(1, Number(page) || 1);
+  var total = globalSearchTotal(query);
+  return {
+    hits: globalSearch(query, size, (p - 1) * size),
+    total: total,
+    page: p,
+    hasMore: p * size < total,
+    engine: 'local'
+  };
 }
 
 var _snipCache = {};
@@ -809,10 +999,13 @@ function searchSnippet(post, query) {
   var cacheKey = (post.id || '') + '|' + q.toLowerCase();
   if (_snipCache[cacheKey] !== undefined) return _snipCache[cacheKey];
   var qLow = q.toLowerCase();
-  var src = stripMd(post.content || '');
-  var idx = src.toLowerCase().indexOf(qLow);
-  if (idx < 0) { src = post.excerpt || ''; idx = src.toLowerCase().indexOf(qLow); }
-  if (idx < 0) { src = post.title || ''; idx = src.toLowerCase().indexOf(qLow); }
+  var fields = [post.snippet || '', post.content || '', post.excerpt || '', post.title || ''];
+  var src = '', idx = -1;
+  for (var i = 0; i < fields.length; i++) {
+    var candidate = stripMd(fields[i] || '');
+    var pos = candidate.toLowerCase().indexOf(qLow);
+    if (pos >= 0) { src = candidate; idx = pos; break; }
+  }
   if (idx < 0) { _snipCache[cacheKey] = ''; return ''; }
   var result = sentenceContext(src, idx, q.length);
   _snipCache[cacheKey] = result;
@@ -859,6 +1052,99 @@ function highlightQuery(text, query) {
   var term = esc(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return safe.replace(new RegExp('(' + term + ')', 'gi'), '<mark class="sh-hl">$1</mark>');
 }
+
+/* 搜索分页与结果渲染：云端走 FTS5 API，静态模式走本地索引。 */
+var _searchRequestId = 0;
+var _searchState = null;
+async function fetchCloudSearchPage(query, page) {
+  var data = await apiFetch('api/search?q=' + encodeURIComponent(query) + '&page=' + page + '&pageSize=10');
+  return {
+    hits: Array.isArray(data && data.results) ? data.results : [],
+    total: Number(data && data.total) || 0,
+    page: Number(data && data.page) || page,
+    hasMore: !!(data && data.hasMore),
+    engine: (data && data.engine) || 'fts5'
+  };
+}
+function searchResultHtml(post, query) {
+  var snip = searchSnippet(post, query);
+  var tags = Array.isArray(post.tags) ? post.tags.join(' · ') : String(post.tags || '');
+  var qLow = String(query || '').toLowerCase();
+  var tagLine = tags && tags.toLowerCase().indexOf(qLow) >= 0
+    ? '<div class="sh-tags">' + highlightQuery(tags, query) + '</div>'
+    : '';
+  return '<a class="search-hit" href="' + esc(href(postUrl(post.id))) + '">'
+    + '<div class="sh-title">' + highlightQuery(post.title || '', query) + '</div>'
+    + (snip ? '<div class="sh-snip">' + highlightQuery(snip, query) + '</div>' : '')
+    + tagLine
+    + '</a>';
+}
+function paintSearchResults() {
+  var panel = document.querySelector('#searchPanel');
+  var state = _searchState;
+  if (!panel || !state) return;
+  if (!state.hits.length) {
+    panel.innerHTML = '<div class="search-empty">' + t('search.noMatch') + '</div>';
+  } else {
+    var html = '<div class="search-meta">' + esc(t('search.results', { count: state.total })) + '</div>';
+    html += state.hits.map(function (post) { return searchResultHtml(post, state.q); }).join('');
+    if (state.hasMore) html += '<button type="button" class="search-more" id="searchMore">' + esc(t('search.more')) + '</button>';
+    panel.innerHTML = html;
+    var more = panel.querySelector('#searchMore');
+    if (more) more.addEventListener('click', loadMoreSearchResults);
+  }
+  panel.classList.add('open');
+}
+async function renderSearchPanel(query) {
+  var panel = document.querySelector('#searchPanel');
+  if (!panel) return;
+  var q = String(query || '').trim();
+  if (!q) {
+    _searchRequestId++;
+    _searchState = null;
+    panel.innerHTML = '';
+    panel.classList.remove('open');
+    return;
+  }
+  var requestId = ++_searchRequestId;
+  _searchState = { q: q, hits: [], total: 0, page: 1, hasMore: false, engine: 'local', loading: true };
+  panel.innerHTML = '<div class="search-empty">' + t('search.loading') + '</div>';
+  panel.classList.add('open');
+  var data;
+  try {
+    data = _cloudOn() ? await fetchCloudSearchPage(q, 1) : searchLocalPage(q, 1);
+  } catch (e) {
+    if (requestId !== _searchRequestId) return;
+    data = searchLocalPage(q, 1);
+  }
+  if (requestId !== _searchRequestId) return;
+  _searchState = { q: q, hits: data.hits || [], total: data.total || 0, page: data.page || 1, hasMore: !!data.hasMore, engine: data.engine || 'local', loading: false };
+  paintSearchResults();
+}
+async function loadMoreSearchResults() {
+  var state = _searchState;
+  if (!state || state.loading || !state.hasMore) return;
+  var requestId = _searchRequestId;
+  var nextPage = (state.page || 1) + 1;
+  state.loading = true;
+  var more = document.querySelector('#searchMore');
+  if (more) { more.disabled = true; more.textContent = t('search.loading'); }
+  try {
+    var data = state.engine === 'local' ? searchLocalPage(state.q, nextPage) : await fetchCloudSearchPage(state.q, nextPage);
+    if (requestId !== _searchRequestId || _searchState !== state) return;
+    state.hits = state.hits.concat(data.hits || []);
+    state.total = Number(data.total) || state.total;
+    state.page = Number(data.page) || nextPage;
+    state.hasMore = !!data.hasMore;
+    state.loading = false;
+    paintSearchResults();
+  } catch (e) {
+    if (requestId !== _searchRequestId || _searchState !== state) return;
+    state.loading = false;
+    if (more) { more.disabled = false; more.textContent = t('search.more'); }
+  }
+}
+
 
 
 
@@ -1096,6 +1382,72 @@ function loadFeaturedPosts(excludeId) {
   });
 }
 
+/* ---------- 热门文章与阅读数据排行 ---------- */
+function popularRangeLabel(range) {
+  if (range === '7') return t('popular.last7');
+  if (range === '30') return t('popular.last30');
+  return t('popular.all');
+}
+function renderPopularList(items) {
+  var box = document.querySelector('#popularList');
+  if (!box) return;
+  if (!items || !items.length) {
+    box.innerHTML = '<div class="empty"><div class="big">' + svgIcon('heart', 34) + '</div><p>' + t('popular.empty') + '</p></div>';
+    return;
+  }
+  box.innerHTML = items.map(function (p, index) {
+    var tags = normalizeTags(p).slice(0, 3).join(' · ');
+    return '<a class="popular-card" href="' + esc(href(postUrl(p.id))) + '">'
+      + '<span class="popular-rank">' + (index + 1) + '</span>'
+      + '<div class="popular-main"><div class="popular-card-title">' + esc(p.title || t('post.untitled')) + '</div>'
+      + '<div class="popular-card-meta">' + esc(tags || p.date || '') + '</div></div>'
+      + '<div class="popular-metrics"><span title="' + esc(t('post.views')) + '">' + svgIcon('eye', 13) + ' ' + (Number(p.views) || 0) + '</span>'
+      + '<span title="' + esc(t('post.likes')) + '">' + svgIcon('heart', 13) + ' ' + (Number(p.likes) || 0) + '</span>'
+      + '<span title="' + esc(t('comment.title')) + '">' + svgIcon('quote', 13) + ' ' + (Number(p.comments) || 0) + '</span></div></a>';
+  }).join('');
+}
+async function loadPopular(range) {
+  var box = document.querySelector('#popularList');
+  if (!box) return;
+  box.innerHTML = '<div class="featured-loading">' + t('site.loading') + '…</div>';
+  if (_cloudOn()) {
+    try {
+      var data = await apiFetch('api/popular?range=' + encodeURIComponent(range || 'all'));
+      renderPopularList((data && data.items) || []);
+      return;
+    } catch (e) { /* 网络失败时回退本地数据 */ }
+  }
+  try {
+    var scores = await getFeaturedPosts(null, 20);
+    var byId = {};
+    getPublishedPosts().forEach(function (p) { byId[String(p.id)] = p; });
+    renderPopularList(scores.map(function (item) { return Object.assign({}, byId[String(item.id)] || {}, item); }));
+  } catch (e) { renderPopularList([]); }
+}
+function bindPopular() {
+  var tabs = document.querySelectorAll('[data-popular-range]');
+  tabs.forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      tabs.forEach(function (other) { other.classList.remove('active'); });
+      tab.classList.add('active');
+      loadPopular(tab.getAttribute('data-popular-range'));
+    });
+  });
+  loadPopular('all');
+}
+function renderPopular() {
+  var html = renderNav('/popular');
+  html += '<main class="container page-fade"><div class="list-head popular-head"><div><h2 class="page-title">' + svgIcon('heart', 20) + ' ' + t('popular.title') + '</h2><p class="admin-head-sub">' + t('popular.desc') + '</p></div></div>';
+  if (_cloudOn()) {
+    html += '<div class="popular-ranges">'
+      + '<button class="popular-range active" data-popular-range="all">' + t('popular.all') + '</button>'
+      + '<button class="popular-range" data-popular-range="30">' + t('popular.last30') + '</button>'
+      + '<button class="popular-range" data-popular-range="7">' + t('popular.last7') + '</button>'
+      + '</div>';
+  }
+  html += '<div class="popular-list" id="popularList"></div></main>' + renderFooter();
+  return html;
+}
 /* ---------- 管理员门禁 ----------
  * 云端模式（API 可用）：密码存 Cloudflare KV，前端只持有会话 token。
  *   登录 POST /api/admin/login → token 存 localStorage('qingyu.token')。
@@ -1312,7 +1664,16 @@ function buildPostsJs() {
       date: d.date || new Date().toISOString().slice(0, 10),
       tags: normalizeTags(d),
       excerpt: d.excerpt || '',
+      cover: d.cover || '',
+      ogImage: d.ogImage || '',
+      category: d.category || '',
+      series: d.series || '',
+      seriesOrder: Number(d.seriesOrder) || 0,
+      status: d.status || 'published',
+      publishAt: d.publishAt || null,
       pinned: !!d.pinned,
+      protected: !!d.protected,
+      enc: d.protected ? (d.enc || null) : null,
       content: d.content || ''
     };
     if (idx >= 0) all[idx] = item; else all.push(item);
@@ -1344,7 +1705,7 @@ function buildFeedXmlClient(posts, maxItems) {
   var base = cfg.siteUrl || (typeof location !== 'undefined' ? location.origin : '');
   base = String(base || '').replace(/\/+$/, '');
   // 与云端 buildFeedXml 对齐：排除加密文章与草稿（公开产物不外泄）
-  var list = (posts || []).filter(function (p) { return !(p && p.protected) && (p.status || 'published') !== 'draft'; })
+  var list = (posts || []).filter(function (p) { return !(p && p.protected) && (p.status || 'published') === 'published'; })
     .slice().sort(sortPosts).slice(0, maxItems || 20);
   var items = list.map(function (p) {
     var link = base + postUrl(p.id);
@@ -1399,6 +1760,8 @@ function app() { return document.querySelector('#app'); }
   var NAV = [
     { i18n: 'nav.home',     url: '/',          path: '/' },
     { i18n: 'nav.tags',     url: '/tags',      path: '/tags' },
+    { i18n: 'nav.series',   url: '/series',    path: '/series' },
+    { i18n: 'nav.popular',  url: '/popular',   path: '/popular' },
     { i18n: 'nav.archive',  url: '/archive',   path: '/archive' },
     { i18n: 'nav.guestbook',url: '/guestbook', path: '/guestbook' },
     { i18n: 'nav.about',    url: '/about',     path: '/about' }
@@ -1417,6 +1780,8 @@ function app() { return document.querySelector('#app'); }
   var NAV_DEFAULT_ZH = {
     '/': '首页',
     '/tags': '标签',
+    '/series': '系列',
+    '/popular': '热门',
     '/archive': '归档',
     '/guestbook': '留言板',
     '/about': '关于'
@@ -1550,7 +1915,44 @@ function app() { return document.querySelector('#app'); }
     + searchForm
     + '</div>'
     + '<div class="search-panel" id="searchPanel"></div>'
-    + '</header>';
+    + '</header>'
+    + renderAnnounce();
+}
+
+var _announceBound = false;
+/** 站点公告栏：后台「站点信息」开启后在顶栏下方展示，访客可关闭（本地记住） */
+function renderAnnounce() {
+  var site = (getConfig() && getConfig().site) || {};
+  if (!site.announceEnabled) return '';
+  var text = String(site.announceText || '').trim();
+  if (!text) return '';
+  var link = String(site.announceLink || '').trim();
+  var sig = text + '|' + link;
+  try { if (localStorage.getItem('qingyu.announceClosed') === sig) return ''; } catch (e) {}
+  if (!_announceBound) {
+    _announceBound = true;
+    document.addEventListener('click', function (ev) {
+      var node = ev && ev.target;
+      var btn = (node && node.closest) ? node.closest('[data-announce-close]') : null;
+      if (!btn) return;
+      var bar = document.querySelector('#announceBar');
+      if (!bar) return;
+      try { localStorage.setItem('qingyu.announceClosed', bar.getAttribute('data-announce-sig') || ''); } catch (e2) {}
+      bar.style.display = 'none';
+    });
+  }
+  var linkText = String(site.announceLinkText || '').trim() || t('announce.more');
+  var inner = esc(text);
+  if (link) inner += ' <a class="announce-link" href="' + esc(link) + '">' + esc(linkText) + '</a>';
+  var close = site.announceClosable
+    ? '<button class="announce-close" data-announce-close="1" aria-label="' + t('announce.close') + '" title="' + t('announce.close') + '">✕</button>'
+    : '';
+  return '<div class="announce-bar" id="announceBar" data-announce-sig="' + esc(sig) + '" role="status">'
+    + '<div class="container announce-inner">'
+    + '<span class="announce-ico" aria-hidden="true">' + svgIcon('spark', 14) + '</span>'
+    + '<span class="announce-text">' + inner + '</span>'
+    + close
+    + '</div></div>';
 }
 
 function renderFooter() {
@@ -1582,6 +1984,7 @@ function renderFooter() {
   if (!adminOk()) {
     var rssHref = _cloudOn() ? '/api/feed.xml' : (useHashMode() ? 'feed.xml' : '/feed.xml');
     navHtml += '<span class="footer-dot footer-rss">·</span><a class="footer-rss" href="' + esc(rssHref) + '">RSS</a>';
+    navHtml += '<span class="footer-dot">·</span><a href="' + esc(href('/subscribe')) + '">' + esc(t('subscribe.title')) + '</a>';
   }
   // 电脑端专属区块：自定义文字 / 站点声明 / 联系方式 / 友情链接
   var extra = '';
@@ -1904,31 +2307,72 @@ function clearPostCache(id) {
  * 统一供首次加载与发表/删除后的刷新使用，保证嵌套结构、缩进与“回复”按钮一致。
  * 注意：若父评论被删除或不在列表内，其子孙评论会归并到顶层，避免丢失。
  */
-function renderCommentTree(list, canDel) {
+function likedCommentIds() {
+  try {
+    var list = JSON.parse(localStorage.getItem('qingyu.commentLikedIds') || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch (e) { return []; }
+}
+function hasLikedComment(id) { return likedCommentIds().indexOf(String(id)) >= 0; }
+function markCommentLiked(id) {
+  try {
+    var list = likedCommentIds();
+    if (list.indexOf(String(id)) < 0) list.push(String(id));
+    localStorage.setItem('qingyu.commentLikedIds', JSON.stringify(list.slice(-1000)));
+  } catch (e) {}
+}
+function unmarkCommentLiked(id) {
+  try { localStorage.setItem('qingyu.commentLikedIds', JSON.stringify(likedCommentIds().filter(function (x) { return String(x) !== String(id); }))); } catch (e) {}
+}
+function commentSort(a, b) {
+  // 最热：置顶 > 精选 > 点赞 > 写入顺序
+  return (Number(b.pinned) || 0) - (Number(a.pinned) || 0)
+    || (Number(b.featured) || 0) - (Number(a.featured) || 0)
+    || (Number(b.likes) || 0) - (Number(a.likes) || 0)
+    || (Number(a.rid) || 0) - (Number(b.rid) || 0);
+}
+function commentSortNew(a, b) {
+  // 最新：置顶仍然优先，其余按写入顺序倒序
+  return (Number(b.pinned) || 0) - (Number(a.pinned) || 0)
+    || (Number(b.rid) || 0) - (Number(a.rid) || 0);
+}
+/** 顶层评论数量：分页以顶层为准，回复跟随其父评论一起渲染 */
+function commentRootCount(list) {
+  if (!Array.isArray(list) || !list.length) return 0;
+  var byId = {};
+  list.forEach(function (c) { byId[c.id] = 1; });
+  var n = 0;
+  list.forEach(function (c) { if (!(c.parent_id && byId[c.parent_id])) n++; });
+  return n;
+}
+function renderCommentTree(list, canDel, opts) {
+  opts = opts || {};
+  var sorter = typeof opts.sorter === 'function' ? opts.sorter : commentSort;
+  var limit = Number(opts.limit) > 0 ? Number(opts.limit) : 0;
   if (!Array.isArray(list) || !list.length) return '<li class="comment-empty">' + t('comment.noComments') + '</li>';
   var roots = [];
   var childMap = {};
   var byId = {};
   list.forEach(function (c) { byId[c.id] = c; childMap[c.id] = []; });
   list.forEach(function (c) {
-    // 只有父评论存在且在同一列表内才作为子评论挂靠，否则归到顶层
     if (c.parent_id && byId[c.parent_id]) childMap[c.parent_id].push(c);
     else roots.push(c);
   });
+  roots.sort(sorter);
+  if (limit && roots.length > limit) roots = roots.slice(0, limit);
 
-  // 递归渲染单个评论及其子评论
   function renderOne(c, depth) {
     var replies = childMap[c.id] || [];
+    var liked = hasLikedComment(c.id);
+    var likeBtn = '<button class="comment-like' + (liked ? ' liked' : '') + '" data-like-id="' + esc(c.id) + '" aria-label="' + esc(t('comment.like')) + '">' + svgIcon('heart', 12) + ' <span>' + (Number(c.likes) || 0) + '</span></button>';
     var replyBtn = (depth < 3)
       ? '<button class="comment-reply-btn" data-reply-id="' + esc(c.id) + '" data-reply-author="' + esc(c.author) + '">' + t('comment.reply') + '</button>'
       : '';
     var delBtn = canDel
       ? '<button class="comment-del" data-cid="' + esc(c.id) + '">' + t('comment.delete') + '</button>'
       : '';
-    // 在内容下方标注“回复了某人”（若该评论是回复）
-    // 安全：t() 的插值不做转义，作者名可能含 HTML（服务端只清控制字符），
-    // 必须对整个结果 esc 再进 innerHTML（同 admin.js 的 comment.replyTo 用法），
-    // 否则父评论作者名可构造存储型 XSS（他人回复时对所有访客触发）。
+    var badges = (Number(c.pinned) ? '<span class="comment-badge pinned">' + t('comment.pinned') + '</span>' : '')
+      + (Number(c.featured) ? '<span class="comment-badge featured">' + t('comment.featured') + '</span>' : '');
     var replyToLabel = '';
     if (c.parent_id && byId[c.parent_id]) {
       replyToLabel = '<div class="comment-reply-to">' + esc(t('comment.replyTo', { author: byId[c.parent_id].author })) + '</div>';
@@ -1937,11 +2381,11 @@ function renderCommentTree(list, canDel) {
       ? '<ul class="comment-children">' + replies.map(function (r) { return renderOne(r, depth + 1); }).join('') + '</ul>'
       : '';
     var initial = String(c.author || '?').trim().slice(0, 1) || '?';
-    return '<li class="comment" data-id="' + esc(c.id) + '"><div class="comment-head">'
+    return '<li class="comment' + (Number(c.pinned) ? ' pinned' : '') + (Number(c.featured) ? ' featured' : '') + '" data-id="' + esc(c.id) + '"><div class="comment-head">'
       + '<span class="comment-avatar" aria-hidden="true">' + esc(initial) + '</span>'
-      + '<span class="comment-author">' + esc(c.author) + '</span>'
+      + '<span class="comment-author">' + esc(c.author) + '</span>' + badges
       + '<span class="comment-date">' + esc(c.date || '') + '</span>'
-      + '<span class="comment-actions">' + replyBtn + delBtn + '</span>'
+      + '<span class="comment-actions">' + likeBtn + replyBtn + delBtn + '</span>'
       + '</div>'
       + '<div class="comment-main">'
       + replyToLabel
@@ -1953,12 +2397,145 @@ function renderCommentTree(list, canDel) {
   return roots.map(function (c) { return renderOne(c, 0); }).join('');
 }
 
+function relationTitleKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+function resolveWikiLink(label) {
+  var raw = String(label || '').trim();
+  if (!raw) return null;
+  var posts = getPublishedPosts();
+  var hit = posts.find(function (p) { return String(p.id) === raw; });
+  if (!hit) {
+    var key = relationTitleKey(raw);
+    hit = posts.find(function (p) { return relationTitleKey(p.title) === key; });
+  }
+  if (!hit) {
+    var sl = slug(raw);
+    hit = posts.find(function (p) { return slug(p.title || '') === sl; });
+  }
+  return hit || null;
+}
+function postIdFromLinkUrl(url) {
+  var value = String(url || '').trim().replace(/^<|>$/g, '');
+  if (!value) return '';
+  if (value.indexOf('#/') === 0) value = value.slice(1);
+  try {
+    var pathname = /^https?:\/\//i.test(value) ? new URL(value).pathname : value.split(/[?#]/)[0];
+    var parts = pathname.split('/').filter(Boolean);
+    if (parts[0] === 'posts' && parts[1]) {
+      try { return decodeURIComponent(parts[1]); } catch (e) { return parts[1]; }
+    }
+  } catch (e) { /* malformed URL */ }
+  return '';
+}
+function collectPostLinkTargets(content) {
+  var posts = getPublishedPosts();
+  var refs = [];
+  var src = String(content || '');
+  var wikiRe = /\[\[([^\[\]\n]{1,160})\]\]/g;
+  var match;
+  while ((match = wikiRe.exec(src)) !== null) refs.push(String(match[1]).split('|')[0].trim());
+  var mdRe = /\[[^\]]*\]\(\s*([^)\s]+)(?:\s+["'][^"']*["'])?\s*\)/g;
+  while ((match = mdRe.exec(src)) !== null) {
+    var id = postIdFromLinkUrl(match[1]);
+    if (id) refs.push(id);
+  }
+  var out = [];
+  var seen = {};
+  refs.forEach(function (ref) {
+    var hit = resolveWikiLink(ref);
+    if (!hit && posts.some(function (p) { return String(p.id) === ref; })) hit = { id: ref };
+    if (hit && !seen[hit.id]) { seen[hit.id] = true; out.push(hit.id); }
+  });
+  return out;
+}
+function relationScore(current, other) {
+  var currentTags = normalizeTags(current).map(relationTitleKey);
+  var otherTags = normalizeTags(other).map(relationTitleKey);
+  var shared = currentTags.filter(function (tag) { return otherTags.indexOf(tag) >= 0; }).length;
+  var sameSeries = current.series && other.series && String(current.series).trim() === String(other.series).trim() ? 1 : 0;
+  return shared * 5 + sameSeries * 8;
+}
+function relationSortRecent(a, b) {
+  return String(b.date || '').localeCompare(String(a.date || '')) || String(a.id || '').localeCompare(String(b.id || ''));
+}
+function getLocalPostRelations(postId) {
+  var posts = getPublishedPosts();
+  var current = posts.find(function (p) { return String(p.id) === String(postId); });
+  if (!current) return { related: [], backlinks: [] };
+  var backlinks = [];
+  var backIds = {};
+  var others = posts.filter(function (p) { return String(p.id) !== String(postId); });
+  others.forEach(function (p) {
+    if (collectPostLinkTargets(p.content || p.search || '').indexOf(String(postId)) >= 0) {
+      backlinks.push(p);
+      backIds[String(p.id)] = true;
+    }
+  });
+  backlinks.sort(relationSortRecent);
+  var related = others
+    .filter(function (p) { return !backIds[String(p.id)]; })
+    .map(function (p) { return { post: p, score: relationScore(current, p) }; })
+    .filter(function (item) { return item.score > 0; })
+    .sort(function (a, b) { return b.score - a.score || relationSortRecent(a.post, b.post); })
+    .slice(0, 4)
+    .map(function (item) { return item.post; });
+  if (related.length < 4) {
+    var used = {};
+    related.forEach(function (p) { used[String(p.id)] = true; });
+    backlinks.forEach(function (p) { used[String(p.id)] = true; });
+    others.slice().sort(relationSortRecent).forEach(function (p) {
+      if (related.length >= 4 || used[String(p.id)]) return;
+      used[String(p.id)] = true;
+      related.push(p);
+    });
+  }
+  return { related: related.slice(0, 4), backlinks: backlinks.slice(0, 8) };
+}
+function renderRelationsHtml(relations) {
+  var related = (relations && relations.related) || [];
+  var backlinks = (relations && relations.backlinks) || [];
+  if (!related.length && !backlinks.length) return '';
+  var html = '<div class="relations-box">';
+  if (related.length) {
+    html += '<section class="relations-section related-posts"><div class="relations-title">' + svgIcon('link', 15) + ' ' + esc(t('post.related')) + '</div><div class="related-grid">';
+    related.forEach(function (p) {
+      var tags = normalizeTags(p).slice(0, 2).join(' · ');
+      html += '<a class="related-card" href="' + esc(href(postUrl(p.id))) + '"><div class="related-card-title">' + esc(p.title || t('post.untitled')) + '</div><div class="related-card-meta">' + esc(tags || p.date || '') + '</div></a>';
+    });
+    html += '</div></section>';
+  }
+  if (backlinks.length) {
+    html += '<section class="relations-section backlinks"><div class="relations-title">' + svgIcon('arrow-left', 15) + ' ' + esc(t('post.backlinks')) + '</div><ul class="backlink-list">';
+    backlinks.forEach(function (p) {
+      html += '<li class="backlink-item"><a href="' + esc(href(postUrl(p.id))) + '"><span class="backlink-title">' + esc(p.title || t('post.untitled')) + '</span><span class="backlink-date">' + esc(p.date || '') + '</span></a></li>';
+    });
+    html += '</ul></section>';
+  }
+  return html + '</div>';
+}
+async function loadPostRelations(postId) {
+  var box = document.querySelector('#postRelations');
+  if (!box) return;
+  var relations = getLocalPostRelations(postId);
+  if (_cloudOn()) {
+    try {
+      var data = await apiFetch('api/posts/' + encodeURIComponent(postId) + '/relations');
+      if (data) relations = { related: Array.isArray(data.related) ? data.related : [], backlinks: Array.isArray(data.backlinks) ? data.backlinks : [] };
+    } catch (e) { /* 网络失败时使用本地推断 */ }
+  }
+  var target = document.querySelector('#postRelations');
+  if (target && target === box) target.innerHTML = renderRelationsHtml(relations);
+}
+
 async function renderPost(id) {
   var cur = currentRoute();
   var html = renderNav(cur.path);
   var posts = getPublishedPosts();
   var post = posts.find(function (p) { return p.id === id; });
   html += '<main class="container page-fade"><div class="post-body">';
+  html += '<div class="reading-progress" id="readingProgress" aria-hidden="true"><span></span></div>';
+
   if (!post) {
     // 云端列表尚未拉取完成（boot 探测中）时不能急于下结论：刷新文章页会出现
     // 「内容不存在」一闪而过（内容刚加载出来前先闪红字再变正常）。
@@ -2037,17 +2614,57 @@ async function renderPost(id) {
   var tocHeadings = tocRes.headings;
   var tags = normalizeTags(post).map(function (t) { return '<a href="' + esc(href('/', { tag: t })) + '" data-tag-link>' + esc(t) + '</a>'; }).join('');
   var minutes = Math.max(1, Math.ceil((stripMd(content || '').length / 400)));
-  html += '<div class="post-header"><h1>' + esc(post.title || '') + '</h1><div class="meta"><span class="meta-date">' + esc(post.date || '') + '</span><span class="meta-dot">·</span><span>' + minutes + ' ' + t('post.minRead') + '</span><span class="meta-dot">·</span><span class="meta-views">' + svgIcon('eye', 14) + ' <span id="viewCount">0</span> ' + t('post.views') + '</span>' + (post.pinned ? '<span class="pin">' + svgIcon('pin', 13) + ' ' + t('post.pin') + '</span>' : '') + '</div></div>';
+  var seriesMeta = post.series ? '<a class="pin" href="' + esc(href(seriesUrl(post.series))) + '">' + svgIcon('list', 13) + ' ' + esc(post.series) + '</a>' : '';
+  html += '<div class="post-header"><h1>' + esc(post.title || '') + '</h1><div class="meta"><span class="meta-date">' + esc(post.date || '') + '</span><span class="meta-dot">·</span><span>' + minutes + ' ' + t('post.minRead') + '</span><span class="meta-dot">·</span><span class="meta-views">' + svgIcon('eye', 14) + ' <span id="viewCount">0</span> ' + t('post.views') + '</span>' + seriesMeta + (post.pinned ? '<span class="pin">' + svgIcon('pin', 13) + ' ' + t('post.pin') + '</span>' : '') + '</div></div>';
+  html += '<div class="reading-tools"><span class="rt-label">' + t('post.fontSize') + '</span>' +
+    '<button type="button" class="rt-btn" data-rs="-1" aria-label="' + t('post.fontSmaller') + '" title="' + t('post.fontSmaller') + '">A−</button>' +
+    '<button type="button" class="rt-btn" data-rs="0" aria-label="' + t('post.fontReset') + '" title="' + t('post.fontReset') + '">A</button>' +
+    '<button type="button" class="rt-btn" data-rs="1" aria-label="' + t('post.fontLarger') + '" title="' + t('post.fontLarger') + '">A+</button>' +
+    '</div>';
   html += aiPostSlot(post);
   html += toc;
   html += '<article class="article">' + bodyHtml + '</article>';
+  if (toc) {
+    html += '<button type="button" class="toc-fab" id="tocFab" aria-label="' + t('toc.open') + '">' + svgIcon('list', 18) + '</button>' +
+      '<div class="toc-sheet" id="tocSheet" hidden><div class="toc-sheet-head"><span>' + t('toc.title') + '</span>' +
+      '<button type="button" class="toc-sheet-close" id="tocSheetClose" aria-label="' + t('announce.close') + '">✕</button></div>' +
+      '<div class="toc-sheet-list">' + tocHeadings.map(function (h) {
+        return '<a href="#' + esc(h.id) + '" data-toc="' + esc(h.id) + '" style="padding-left:' + (8 + (h.lvl - 1) * 14) + 'px"><span class="toc-num">' + esc(h.num) + '</span>' + esc(h.text) + '</a>';
+      }).join('') + '</div></div>';
+  }
   // 点赞：正文尾部，水平居中
   html += '<div class="like-bar"><button class="btn like-btn" id="likeBtn">' + svgIcon('heart', 15) + ' <span id="likeCount">0</span></button></div>';
   // 底部：左标签、右复制链接(+编辑)
   var afEdit = adminOk()
     ? '<a class="btn" href="' + esc(href(postUrl(post.id) + 'edit')) + '">' + svgIcon('pen', 13) + ' ' + t('post.edit') + '</a>'
     : '';
-  html += '<div class="article-footer"><div class="af-tags">' + (tags || '') + '</div><div class="af-actions">' + afEdit + '<button class="btn" id="btnCopyLink">' + svgIcon('link', 14) + ' ' + t('post.copyLink') + '</button></div></div>';
+  var shareSupported = !!(typeof navigator !== 'undefined' && navigator.share);
+  var shareMenu = '<div class="share-wrap">'
+    + '<button class="btn" id="btnShare" aria-haspopup="true" aria-expanded="false" title="' + esc(t('post.share')) + '">' + svgIcon('external', 14) + ' ' + t('post.share') + '</button>'
+    + '<div class="share-menu" id="shareMenu" role="menu" hidden>'
+    + '<button class="share-item" id="btnCopyLink" data-share="copy" role="menuitem">' + svgIcon('link', 14) + ' ' + t('post.copyLink') + '</button>'
+    + (shareSupported ? '<button class="share-item" data-share="native" role="menuitem">' + svgIcon('send', 14) + ' ' + t('post.shareNative') + '</button>' : '')
+    + '<a class="share-item" data-share="weibo" role="menuitem" target="_blank" rel="noopener">' + t('post.shareWeibo') + '</a>'
+    + '<a class="share-item" data-share="x" role="menuitem" target="_blank" rel="noopener">' + t('post.shareX') + '</a>'
+    + '<a class="share-item" data-share="facebook" role="menuitem" target="_blank" rel="noopener">' + t('post.shareFacebook') + '</a>'
+    + '<a class="share-item" data-share="telegram" role="menuitem" target="_blank" rel="noopener">' + t('post.shareTelegram') + '</a>'
+    + '<a class="share-item" data-share="email" role="menuitem">' + t('post.shareEmail') + '</a>'
+    + '</div></div>';
+  html += '<div class="article-footer"><div class="af-tags">' + (tags || '') + '</div><div class="af-actions">' + afEdit + shareMenu + '</div></div>';
+  // 双向链接与相关文章（静态模式本地计算，云端异步拉取）
+  html += '<div class="relations-slot" id="postRelations"></div>';
+
+  // 系列内上一篇 / 下一篇
+  if (post.series) {
+    var seriesPosts = posts.filter(function (p) { return String(p.series || '').trim() === String(post.series).trim(); }).sort(seriesSort);
+    var si = seriesPosts.findIndex(function (p) { return p.id === post.id; });
+    var sp = si > 0 ? seriesPosts[si - 1] : null;
+    var sn = si >= 0 && si < seriesPosts.length - 1 ? seriesPosts[si + 1] : null;
+    html += '<div class="series-nav"><div class="series-nav-title">' + svgIcon('list', 15) + ' ' + t('post.inSeries') + ': <a href="' + esc(href(seriesUrl(post.series))) + '">' + esc(post.series) + '</a></div><div class="pn-nav">';
+    if (sp) html += '<a class="pn-item" href="' + esc(href(postUrl(sp.id))) + '"><span class="pn-dir">' + t('post.prev') + '</span><span class="pn-title">' + esc(sp.title || '') + '</span></a>';
+    if (sn) html += '<a class="pn-item" href="' + esc(href(postUrl(sn.id))) + '"><span class="pn-dir">' + t('post.next') + '</span><span class="pn-title">' + esc(sn.title || '') + '</span></a>';
+    html += '</div></div>';
+  }
 
   // prev / next
   var sorted = posts.slice().sort(sortPosts);
@@ -2069,11 +2686,12 @@ async function renderPost(id) {
   html += '</div>';
 
   // comments
-  html += '<div class="comments"><h3>' + t('comment.title') + ' <span class="comment-count" id="commentCount">' + '0' + '</span></h3>';
+  html += '<div class="comments"><div class="comments-head"><h3>' + t('comment.title') + ' <span class="comment-count" id="commentCount">0</span></h3>' +
+    '<div class="comment-sort" id="commentSort" role="tablist"><button type="button" class="cs-btn active" data-sort="hot" role="tab" aria-selected="true">' + t('comment.sortHot') + '</button><button type="button" class="cs-btn" data-sort="new" role="tab" aria-selected="false">' + t('comment.sortNew') + '</button></div></div>';
   html += '<p class="comment-hint">' + t('comment.hint') + '</p>';
   html += '<div class="reply-indicator" id="replyIndicator" style="display:none"><span id="replyTo"></span><button class="reply-cancel" id="replyCancel">✕</button></div>';
   html += '<div class="comment-form"><input type="text" id="commentAuthor" maxlength="30" placeholder="' + t('comment.authorPlaceholder') + '"><div class="comment-editor-row"><textarea id="commentContent" rows="2" maxlength="1000" placeholder="' + t('comment.contentPlaceholder') + '"></textarea><button type="button" class="comment-emoji-btn" id="commentEmoji" title="' + t('comment.emoji') + '" aria-label="' + t('comment.emoji') + '">😊</button></div><div class="comment-submit-row"><button class="btn btn-primary" id="commentSubmit">' + t('comment.submit') + '</button><span class="c-status" id="commentStatus"></span></div></div>';
-  html += '<ul class="comment-list" id="commentList"></ul></div>';
+  html += '<ul class="comment-list" id="commentList"></ul><div class="comment-more" id="commentMore" style="display:none"><button type="button" class="btn" id="commentMoreBtn">' + t('comment.loadMore') + '</button></div></div>';
 
   // 精选文章（评论区下方）
   html += renderFeaturedHtml(post.id);
@@ -2108,25 +2726,135 @@ async function renderPost(id) {
     });
   }
 
-  var copyBtn = document.querySelector('#btnCopyLink');
-  if (copyBtn) copyBtn.addEventListener('click', function () {
+  // 分享：复制链接 / 系统分享 / 社交平台（点击展开菜单）
+  (function initShare() {
+    var shareBtn = document.querySelector('#btnShare');
+    var menu = document.querySelector('#shareMenu');
+    if (!shareBtn || !menu) return;
     var url = location.origin + appRoot() + postUrl(post.id);
-    navigator.clipboard && navigator.clipboard.writeText(url) && (copyBtn.textContent = t('post.copied'));
-  });
+    var text = post.title || document.title || '';
+    var targets = {
+      weibo: 'https://service.weibo.com/share/share.php?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent(text),
+      x: 'https://twitter.com/intent/tweet?url=' + encodeURIComponent(url) + '&text=' + encodeURIComponent(text),
+      facebook: 'https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(url),
+      telegram: 'https://t.me/share/url?url=' + encodeURIComponent(url) + '&text=' + encodeURIComponent(text),
+      email: 'mailto:?subject=' + encodeURIComponent(text) + '&body=' + encodeURIComponent(url)
+    };
+    function closeMenu() { menu.hidden = true; shareBtn.setAttribute('aria-expanded', 'false'); }
+    function openMenu() { menu.hidden = false; shareBtn.setAttribute('aria-expanded', 'true'); }
+    shareBtn.addEventListener('click', function (e) {
+      if (e && e.stopPropagation) e.stopPropagation();
+      if (menu.hidden) openMenu(); else closeMenu();
+    });
+    document.addEventListener('click', function (e) {
+      if (!menu.hidden && e.target !== shareBtn && !(menu.contains && menu.contains(e.target))) closeMenu();
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeMenu(); });
+    menu.querySelectorAll('[data-share]').forEach(function (el) {
+      var kind = el.getAttribute('data-share');
+      if (kind === 'copy') {
+        el.addEventListener('click', function () {
+          var done = function () {
+            el.textContent = t('post.copied');
+            closeMenu();
+            setTimeout(function () { el.innerHTML = svgIcon('link', 14) + ' ' + t('post.copyLink'); }, 1600);
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(done, done); else done();
+        });
+      } else if (kind === 'native') {
+        el.addEventListener('click', function () {
+          closeMenu();
+          if (navigator.share) { try { navigator.share({ title: text, url: url }).catch(function () {}); } catch (err) {} }
+        });
+      } else if (targets[kind]) {
+        el.setAttribute('href', targets[kind]);
+      }
+    });
+  })();
 
-  // load comments（构建评论树：顶层 + 嵌套回复统一渲染）
+  // 正文字号：就地调整并记忆
+  var rsWrap = document.querySelector('#readingToolsHost') || document.querySelector('.reading-tools');
+  if (rsWrap) {
+    rsWrap.querySelectorAll('[data-rs]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var step = Number(b.getAttribute('data-rs'));
+        var next = step === 0 ? 1 : (getReadingScale() + step * 0.1);
+        setReadingScale(next);
+        toast(t('post.fontSize') + ' ' + Math.round(getReadingScale() * 100) + '%', 'ok');
+      });
+    });
+  }
+  // 移动端浮动目录：抽屉展开 / 关闭
+  var tocFab = document.querySelector('#tocFab');
+  var tocSheet = document.querySelector('#tocSheet');
+  function closeTocSheet() { if (tocSheet) tocSheet.hidden = true; }
+  if (tocFab && tocSheet) {
+    tocFab.addEventListener('click', function () { tocSheet.hidden = !tocSheet.hidden; });
+    var tocClose = document.querySelector('#tocSheetClose');
+    if (tocClose) tocClose.addEventListener('click', closeTocSheet);
+    tocSheet.querySelectorAll('a[data-toc]').forEach(function (a) { a.addEventListener('click', closeTocSheet); });
+  }
+
+  // load comments（顶层 + 嵌套回复统一渲染；支持「最热 / 最新」排序与分页）
+  var CMT_PAGE = 8;
+  var _cmtState = { sort: 'hot', shown: CMT_PAGE, list: [] };
   function refreshComments(list) {
+    _cmtState.list = Array.isArray(list) ? list : [];
+    _cmtState.shown = CMT_PAGE;
+    renderCommentView();
+  }
+  function renderCommentView() {
     var ul = document.querySelector('#commentList');
     var cnt = document.querySelector('#commentCount');
+    var moreWrap = document.querySelector('#commentMore');
     if (!ul) return;
-    if (cnt) cnt.textContent = String(list ? list.length : 0);
+    var list = _cmtState.list;
+    if (cnt) cnt.textContent = String(list.length);
+    if (!list.length) {
+      ul.innerHTML = '<li class="comment-empty">' + t('comment.noComments') + '</li>';
+      if (moreWrap) moreWrap.style.display = 'none';
+      return;
+    }
     var canDel = !_cloudOn() || adminOk();
-    if (!list || !list.length) { ul.innerHTML = '<li class="comment-empty">' + t('comment.noComments') + '</li>'; return; }
-    ul.innerHTML = renderCommentTree(list, canDel);
+    var sorter = _cmtState.sort === 'new' ? commentSortNew : commentSort;
+    ul.innerHTML = renderCommentTree(list, canDel, { sorter: sorter, limit: _cmtState.shown });
+    if (moreWrap) moreWrap.style.display = commentRootCount(list) > _cmtState.shown ? 'block' : 'none';
+    bindCommentActions(ul);
+  }
+  function bindCommentActions(ul) {
     // 删除按钮
     ul.querySelectorAll('.comment-del').forEach(function (b) {
       b.addEventListener('click', function () {
         deleteComment(post.id, b.getAttribute('data-cid')).then(refreshComments);
+      });
+    });
+    // 评论点赞（每浏览器一次，云端调用点赞接口）
+    ul.querySelectorAll('.comment-like').forEach(function (b) {
+      b.addEventListener('click', async function () {
+        var cid = b.getAttribute('data-like-id');
+        if (!cid || b.classList.contains('liked') || b.disabled) return;
+        b.disabled = true;
+        markCommentLiked(cid);
+        b.classList.add('liked');
+        var countEl = b.querySelector('span');
+        var oldCount = countEl ? Number(countEl.textContent) || 0 : 0;
+        if (countEl) countEl.textContent = String(oldCount + 1);
+        try {
+          if (_cloudOn()) {
+            var result = await apiFetch('api/comments/' + encodeURIComponent(cid) + '/like', { method: 'POST', body: '{}' });
+            if (countEl && result && result.likes !== undefined) countEl.textContent = String(Number(result.likes) || 0);
+          } else {
+            var localList = await loadComments(post.id);
+            var target = localList.find(function (item) { return String(item.id) === String(cid); });
+            if (target) target.likes = oldCount + 1;
+            try { localStorage.setItem(commentKey(post.id), JSON.stringify(localList)); } catch (e) {}
+          }
+        } catch (e) {
+          unmarkCommentLiked(cid);
+          b.classList.remove('liked');
+          if (countEl) countEl.textContent = String(oldCount);
+          toast(t('comment.likeFail'), 'err');
+        } finally { b.disabled = false; }
       });
     });
     // 回复按钮（含二级/三级回复，均可继续回复）
@@ -2144,6 +2872,28 @@ async function renderPost(id) {
       });
     });
   }
+  var sortWrap = document.querySelector('#commentSort');
+  if (sortWrap) {
+    sortWrap.querySelectorAll('[data-sort]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var v = b.getAttribute('data-sort');
+        if (v === _cmtState.sort) return;
+        _cmtState.sort = v;
+        _cmtState.shown = CMT_PAGE;
+        sortWrap.querySelectorAll('[data-sort]').forEach(function (x) {
+          var on = x === b;
+          x.classList.toggle('active', on);
+          x.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        renderCommentView();
+      });
+    });
+  }
+  var moreBtn = document.querySelector('#commentMoreBtn');
+  if (moreBtn) moreBtn.addEventListener('click', function () {
+    _cmtState.shown += CMT_PAGE;
+    renderCommentView();
+  });
   loadComments(post.id).then(refreshComments);
 
   // 取消回复
@@ -2181,6 +2931,8 @@ async function renderPost(id) {
       submit.disabled = false;
     }
   });
+
+  loadPostRelations(post.id);
 }
 
 /* 正文加载失败（网络/超时）时渲染的静态失败页：保留标题，提供手动重试，不再自动循环拉取 */
@@ -2267,6 +3019,119 @@ function renderAbout() {
   html += '<h3>' + t('about.version') + '</h3><p>v' + esc(BLOG_VERSION) + '</p><h3>' + t('about.dataMode') + '</h3><p>' + (_cloudOn() ? t('about.cloudMode') : t('about.staticMode')) + '</p><h3>' + t('about.firstUse') + '</h3><p>' + t('about.firstUseHint') + '</p>';
   html += '</div></main>' + renderFooter();
   return html;
+}
+
+/* ---------- 文章系列 / 专栏 ---------- */
+function seriesUrl(name) {
+  return '/series/' + encodeURIComponent(String(name || '')) + '/';
+}
+function seriesSort(a, b) {
+  var ao = Number(a.seriesOrder) || 0, bo = Number(b.seriesOrder) || 0;
+  if (ao > 0 && bo > 0 && ao !== bo) return ao - bo;
+  if (ao > 0 && bo <= 0) return -1;
+  if (ao <= 0 && bo > 0) return 1;
+  return (a.date || '').localeCompare(b.date || '') || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+function getSeriesGroups() {
+  var groups = {};
+  getPublishedPosts().forEach(function (p) {
+    var name = String(p.series || '').trim();
+    if (!name) return;
+    if (!groups[name]) groups[name] = { name: name, posts: [] };
+    groups[name].posts.push(p);
+  });
+  return Object.keys(groups).map(function (k) {
+    groups[k].posts.sort(seriesSort);
+    return groups[k];
+  }).sort(function (a, b) { return a.name.localeCompare(b.name); });
+}
+function renderSeriesList() {
+  var groups = getSeriesGroups();
+  var html = renderNav(currentRoute().path);
+  html += '<main class="container page-fade"><h2 class="page-title">' + svgIcon('list', 20) + ' ' + t('series.title') + '</h2>';
+  html += '<p class="admin-head-sub" style="margin:-8px 0 20px">' + esc(t('series.desc')) + '</p>';
+  if (!groups.length) {
+    html += '<div class="empty"><div class="big">' + svgIcon('list', 36) + '</div><p>' + t('series.empty') + '</p></div>';
+  } else {
+    html += '<div class="list-container">';
+    groups.forEach(function (g, idx) {
+      var first = g.posts[0] || {};
+      html += '<a class="post-card" href="' + esc(href(seriesUrl(g.name))) + '"><div class="post-card-main">' +
+        '<div class="meta"><span class="date">' + esc(t('series.count', { count: g.posts.length })) + '</span><span class="pin">' + svgIcon('list', 13) + ' ' + esc(t('series.label')) + '</span></div>' +
+        '<h2>' + esc(g.name) + '</h2><div class="excerpt">' + esc(g.posts.slice(0, 4).map(function (p) { return p.title || ''; }).join(' · ')) + '</div>' +
+        '<div class="mini-tags"><span>' + esc(t('series.part')) + '</span></div></div>' + renderPostThumb(first, idx) + '</a>';
+    });
+    html += '</div>';
+  }
+  html += '</main>' + renderFooter();
+  return html;
+}
+function renderSeriesDetail(name) {
+  var decoded = String(name || '');
+  var posts = getPublishedPosts().filter(function (p) { return String(p.series || '').trim() === decoded; }).sort(seriesSort);
+  var html = renderNav(currentRoute().path);
+  html += '<main class="container page-fade"><div class="list-head"><div><h2 class="page-title">' + svgIcon('list', 20) + ' ' + esc(decoded) + '</h2><p class="admin-head-sub">' + esc(t('series.count', { count: posts.length })) + '</p></div><a class="btn" href="' + esc(href('/series')) + '">' + svgIcon('arrow-left', 14) + ' ' + t('series.title') + '</a></div>';
+  if (!posts.length) html += '<div class="empty"><div class="big">' + svgIcon('list', 36) + '</div><p>' + t('series.empty') + '</p></div>';
+  else {
+    html += '<div class="list-container">';
+    posts.forEach(function (p, idx) {
+      html += renderCard(p, idx);
+    });
+    html += '</div>';
+  }
+  html += '</main>' + renderFooter();
+  return html;
+}
+
+/* ---------- 邮件订阅 ---------- */
+function renderSubscribe() {
+  var q = currentRoute().query;
+  var notice = '';
+  if (q.confirmed === '1') notice = '<div class="subscribe-notice ok">' + t('subscribe.confirmed') + '</div>';
+  else if (q.confirmed === '0') notice = '<div class="subscribe-notice err">' + t('subscribe.invalid') + '</div>';
+  else if (q.unsubscribed === '1') notice = '<div class="subscribe-notice ok">' + t('subscribe.unsubscribed') + '</div>';
+  else if (q.unsubscribed === '0') notice = '<div class="subscribe-notice err">' + t('subscribe.invalid') + '</div>';
+  var html = renderNav('/subscribe');
+  html += '<main class="container page-fade"><h2 class="page-title">' + svgIcon('send', 20) + ' ' + t('subscribe.title') + '</h2>';
+  html += '<div class="card subscribe-card"><p class="subscribe-desc">' + t('subscribe.desc') + '</p>' + notice;
+  html += '<div class="subscribe-form"><input class="subscribe-input" id="subscribeEmail" type="email" maxlength="254" placeholder="' + t('subscribe.emailPlaceholder') + '" autocomplete="email"><button class="btn btn-primary" id="subscribeBtn">' + t('subscribe.button') + '</button></div><p class="subscribe-status" id="subscribeStatus"></p>';
+  html += '<p class="subscribe-privacy">' + t('subscribe.privacy') + '</p></div></main>';
+  html += renderFooter();
+  return html;
+}
+function bindSubscribe() {
+  var btn = document.getElementById('subscribeBtn');
+  var input = document.getElementById('subscribeEmail');
+  var status = document.getElementById('subscribeStatus');
+  if (!btn || !input || !status) return;
+  apiFetch('api/subscribe').then(function (d) {
+    if (d && d.enabled === false) {
+      btn.disabled = true;
+      input.disabled = true;
+      status.textContent = t('subscribe.disabled');
+    }
+  }).catch(function () {
+    btn.disabled = true;
+    input.disabled = true;
+    status.textContent = t('subscribe.disabled');
+  });
+  function submit() {
+    var email = String(input.value || '').trim();
+    if (!email) { status.textContent = t('subscribe.emailRequired'); return; }
+    btn.disabled = true;
+    status.textContent = t('site.loading') + '…';
+    apiFetch('api/subscribe', { method: 'POST', body: JSON.stringify({ email: email, locale: (window.__i18n && window.__i18n.getLocale ? window.__i18n.getLocale() : 'zh-CN') }) })
+      .then(function (d) {
+        status.textContent = d && d.already ? t('subscribe.already') : t('subscribe.sent');
+        btn.disabled = false;
+      })
+      .catch(function (e) {
+        status.textContent = (e && e.message) || t('subscribe.fail');
+        btn.disabled = false;
+      });
+  }
+  btn.addEventListener('click', submit);
+  input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submit(); });
 }
 
 function renderTags() {
@@ -3265,6 +4130,7 @@ function buildSitemapClient() {
   lines.push('  <url><loc>' + esc(base + '/') + '</loc></url>');
   lines.push('  <url><loc>' + esc(base + '/about') + '</loc></url>');
   lines.push('  <url><loc>' + esc(base + '/archive') + '</loc></url>');
+  lines.push('  <url><loc>' + esc(base + '/popular') + '</loc></url>');
   lines.push('  <url><loc>' + esc(base + '/guestbook') + '</loc></url>');
   posts.forEach(function (p) {
     lines.push('  <url><loc>' + esc(base + postUrl(p.id)) + '</loc><lastmod>' + esc(p.date || '') + '</lastmod></url>');
@@ -3350,6 +4216,7 @@ function serializeQuery(query) {
 var _i18nReady = false;
 async function route() {
   _searchOpen = false;   // 进入新页面时收起顶部搜索
+  if (typeof closeLightbox === 'function') closeLightbox();
   _featuredCache = null; // 清除精选缓存，确保每页重新计算
   destroySmojiPicker(); // 清理 Smoji 表情选择器
   // 重置 body overflow，防止侧边栏打开时切换语言导致页面无法滚动
@@ -3397,8 +4264,12 @@ async function route() {
     }
   }
   else if (path === '/archive') { app().innerHTML = renderArchive(); }
+  else if (path === '/subscribe') { app().innerHTML = renderSubscribe(); bindSubscribe(); }
   else if (path === '/about') { app().innerHTML = renderAbout(); }
   else if (path === '/tags') { app().innerHTML = renderTags(); }
+  else if (path === '/series') { app().innerHTML = renderSeriesList(); fitCardLineClamps(); }
+  else if (path === '/popular') { app().innerHTML = renderPopular(); bindPopular(); }
+  else if (path.indexOf('/series/') === 0) { var seriesName = ''; try { seriesName = decodeURIComponent(path.slice('/series/'.length)); } catch (e) { seriesName = path.slice('/series/'.length); } app().innerHTML = renderSeriesDetail(seriesName); fitCardLineClamps(); }
   else if (path === '/guestbook') { app().innerHTML = renderGuestbook(); bindGuestbook(); }
   else {
     app().innerHTML = renderNav(path) + '<main class="container page-fade"><div class="empty"><div class="big">' + svgIcon('question', 36) + '</div><p>' + t('post.notFound') + '</p><p><a href="' + esc(href('/')) + '">' + t('post.backHome') + '</a></p></div></main>' + renderFooter();
@@ -3444,7 +4315,7 @@ function updateSEO(path) {
       pageType = 'article';
       pageTitle = (post.title || t('post.untitled')) + ' · ' + n;
       pageDesc = post.excerpt || stripMd(post.content || '').slice(0, 200);
-      if (post.cover) pageImage = post.cover;
+      pageImage = post.ogImage || post.cover || '';
       pageUrl = base + '/posts/' + encodeURIComponent(post.id) + '/';
     }
   } else if (path.indexOf('/admin') === 0 || path === '/write') {
@@ -3505,7 +4376,7 @@ function updateSEO(path) {
         'publisher': { '@type': 'Organization', 'name': n },
         'mainEntityOfPage': pageUrl
       };
-      if (p.cover) jsonLd.image = p.cover;
+      if (p.ogImage || p.cover) jsonLd.image = p.ogImage || p.cover;
       if (p.tags) jsonLd.keywords = p.tags;
       _setJsonLd(jsonLd);
     }
@@ -3846,6 +4717,7 @@ function bindGlobal() {
   if (tb) tb.addEventListener('click', function () { toggleTheme(); });
   bindAccentPicker();
   bindTocScroll();
+  bindArticleEnhancements();
   bindSearch();
   bindBackTop();
   populateLangSwitch();
@@ -4045,6 +4917,8 @@ function updateBackTop() {
       if (y > 8) b.classList.add('scrolled'); else b.classList.remove('scrolled');
     }
   } catch (e) { /* ignore */ }
+  updateReadingProgress();
+  updateTocActive();
   if (!bt || !bt.classList || !bt.classList.add) return;
   if (y > 300) bt.classList.add('show'); else bt.classList.remove('show');
 }
@@ -4111,6 +4985,7 @@ function bindTocScroll() {
       // 若找不到目标，则恢复 router innerHTML 的行为：不阻止默认（可能跳到 404），故此处无默认跳转
     });
   });
+  updateTocActive();
 }
 
 /* 顶部导航搜索：点击搜索图标 → 隐藏导航、显示搜索框；输入实时出结果下拉面板 */
@@ -4135,6 +5010,8 @@ function bindSearch() {
     _searchOpen = false;
     var bar = document.querySelector('.topbar');
     if (bar) bar.classList.remove('searching');
+    _searchRequestId++;
+    _searchState = null;
     if (input) input.value = '';
     if (panel) { panel.innerHTML = ''; panel.classList.remove('open'); }
     _snipCache = {};
@@ -4142,6 +5019,7 @@ function bindSearch() {
   if (input) {
     var _searchTimer = null;
     input.addEventListener('input', function () {
+      _searchRequestId++;
       clearTimeout(_searchTimer);
       _searchTimer = setTimeout(function () { renderSearchPanel(input.value); }, 200);
     });
@@ -4167,26 +5045,6 @@ function bindSearch() {
   }
 }
 
-/* 渲染搜索结果下拉面板（跨全部文章，非当前页过滤） */
-function renderSearchPanel(query) {
-  var panel = document.querySelector('#searchPanel');
-  if (!panel) return;
-  var q = String(query || '').trim();
-  if (!q) { panel.innerHTML = ''; panel.classList.remove('open'); return; }
-  var hits = globalSearch(q, 20);
-  if (!hits.length) {
-    panel.innerHTML = '<div class="search-empty">' + t('search.noMatch') + '</div>';
-  } else {
-    panel.innerHTML = hits.map(function (p) {
-      var snip = searchSnippet(p, q);
-      return '<a class="search-hit" href="' + esc(href(postUrl(p.id))) + '">'
-        + '<div class="sh-title">' + highlightQuery(p.title || '', q) + '</div>'
-        + (snip ? '<div class="sh-snip">' + highlightQuery(snip, q) + '</div>' : '')
-        + '</a>';
-    }).join('');
-  }
-  panel.classList.add('open');
-}
 
 /* AdSense 延迟加载：仅在广告位进入视口后才注入广告库，不与首屏渲染/API 抢带宽。
  * 策略：广告位进入视口（提前 150px 预判）后，最早 2.5s、空闲时 3.5s、兜底 5s 才开始加载广告；
@@ -4282,6 +5140,7 @@ window.__bootPromise = (async function () {
   var cfg = getConfig();
   applyTheme(getTheme());
   applyAccent(getAccent());
+  applyReadingScale();
   bindNavClicks();
   // 全局样式非阻塞加载后，首帧渲染前需等它就绪（与 i18n 并行），避免 FOUC
   var _cssReady = _waitGlobalStyle();
